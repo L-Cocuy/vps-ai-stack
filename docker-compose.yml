@@ -1,0 +1,138 @@
+version: "3.9"
+
+# ============================================================
+#  VPS AI Stack — Privacy-First AI for Small Businesses
+#  All services run locally. No data leaves your server.
+# ============================================================
+
+networks:
+  ai-stack:
+    driver: bridge
+
+volumes:
+  ollama_data:
+  openwebui_data:
+  n8n_data:
+  postgres_data:
+  traefik_certs:
+
+services:
+
+  # ── Reverse Proxy ──────────────────────────────────────────
+  traefik:
+    image: traefik:v3.0
+    container_name: traefik
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - traefik_certs:/certs
+      - ./configs/traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+    networks:
+      - ai-stack
+
+  # ── Local LLM Engine ──────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      - ai-stack
+    # Uncomment if your VPS has a GPU:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - capabilities: [gpu]
+
+  # ── Chat UI (your private ChatGPT) ────────────────────────
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    restart: unless-stopped
+    depends_on:
+      - ollama
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY}
+      - DEFAULT_USER_ROLE=user
+      - ENABLE_SIGNUP=${ENABLE_SIGNUP:-false}
+    volumes:
+      - openwebui_data:/app/backend/data
+    networks:
+      - ai-stack
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.webui.rule=Host(`chat.${DOMAIN}`)"
+      - "traefik.http.routers.webui.tls.certresolver=letsencrypt"
+      - "traefik.http.services.webui.loadbalancer.server.port=8080"
+
+  # ── Workflow Automation ───────────────────────────────────
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: n8n
+    restart: unless-stopped
+    depends_on:
+      - postgres
+    environment:
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=postgres
+      - DB_POSTGRESDB_DATABASE=${POSTGRES_DB}
+      - DB_POSTGRESDB_USER=${POSTGRES_USER}
+      - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
+      - N8N_HOST=automation.${DOMAIN}
+      - N8N_PROTOCOL=https
+      - WEBHOOK_URL=https://automation.${DOMAIN}
+      - N8N_EMAIL_MODE=smtp
+    volumes:
+      - n8n_data:/home/node/.n8n
+    networks:
+      - ai-stack
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.n8n.rule=Host(`automation.${DOMAIN}`)"
+      - "traefik.http.routers.n8n.tls.certresolver=letsencrypt"
+      - "traefik.http.services.n8n.loadbalancer.server.port=5678"
+
+  # ── Database ──────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - ai-stack
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Model Bootstrapper (runs once, pulls default models) ──
+  ollama-bootstrap:
+    image: ollama/ollama:latest
+    container_name: ollama-bootstrap
+    depends_on:
+      - ollama
+    entrypoint: >
+      sh -c "
+        sleep 5 &&
+        ollama pull llama3.2 &&
+        ollama pull nomic-embed-text &&
+        echo 'Models ready.'
+      "
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    networks:
+      - ai-stack
+    restart: "no"
