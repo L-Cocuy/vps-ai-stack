@@ -19,7 +19,7 @@ Many SMB teams want private AI tools without handing internal data to a third-pa
 - Uses Let's Encrypt HTTP challenge for certificates.
 - Keeps service data in named Docker volumes.
 - Bootstraps two default Ollama models after the API is actually ready.
-- Includes preflight, backup, and restore scripts for basic operations.
+- Includes preflight, backup, restore, health, and hardening audit scripts for basic operations.
 
 ## What This Template Does Not Do
 
@@ -40,6 +40,8 @@ Many SMB teams want private AI tools without handing internal data to a third-pa
 │   └── gpu-setup.md
 ├── scripts/
 │   ├── backup.sh
+│   ├── hardening-check.sh
+│   ├── health-report.sh
 │   ├── preflight.sh
 │   ├── restore.sh
 │   └── setup.sh
@@ -69,7 +71,7 @@ Many SMB teams want private AI tools without handing internal data to a third-pa
 Notes:
 - 4 GB RAM is workable for light use, but low-memory VPS plans will feel slow during model pulls and first inference.
 - First model downloads need extra disk headroom. The preflight script requires at least 20 GB free.
-- NVIDIA GPU support is optional. See [docs/gpu-setup.md](/Volumes/dev_volume/vps-ai-stack/docs/gpu-setup.md).
+- NVIDIA GPU support is optional. See [GPU setup](docs/gpu-setup.md).
 
 ## Quick Start
 
@@ -201,6 +203,18 @@ Create a backup:
 bash scripts/backup.sh
 ```
 
+Create a health report:
+
+```bash
+bash scripts/health-report.sh
+```
+
+Audit host hardening:
+
+```bash
+sudo bash scripts/hardening-check.sh
+```
+
 Restore the latest backup with confirmation:
 
 ```bash
@@ -225,6 +239,33 @@ The backup script creates a timestamped folder under `backups/` and stores:
 - a copy of `.env`
 - `manifest.txt`
 
+By default, backups stay local only. If you enable remote mode in `.env`, the script also:
+
+- creates an encrypted `tar.gz.enc` bundle of the timestamped backup folder
+- uploads that encrypted file to S3, Backblaze B2, or an `rsync` target
+- keeps the original local backup flow unchanged
+
+Remote backup settings in [env.example](env.example):
+
+```env
+BACKUP_REMOTE_ENABLED=false
+BACKUP_REMOTE_TYPE=s3
+BACKUP_PASSPHRASE=replace_with_a_long_unique_passphrase
+BACKUP_S3_BUCKET=your-bucket
+BACKUP_S3_PREFIX=vps-ai-stack
+BACKUP_S3_REGION=us-east-1
+BACKUP_S3_ACCESS_KEY_ID=replace_me
+BACKUP_S3_SECRET_ACCESS_KEY=replace_me
+```
+
+Supported remote modes:
+
+- `s3`: uses the AWS CLI in a helper container
+- `b2`: uses the Backblaze B2 S3-compatible endpoint
+- `rsync`: uses the host `rsync` client over SSH
+
+If remote mode is enabled but incomplete, the script still finishes the local backup first and then exits with a clear error for the remote step.
+
 The restore script:
 
 - stops the stack first
@@ -232,13 +273,15 @@ The restore script:
 - saves your current `.env` as `.env.pre-restore.<timestamp>` before replacing it
 - starts the stack again
 
+Remote restore is intentionally simple: download the encrypted archive, decrypt it, extract it back under `backups/`, and then run `bash scripts/restore.sh`.
+
 Take a fresh backup before intentional upgrades.
 
 ## Image Versions
 
 This template pins explicit image versions instead of `latest` or `main`.
 
-Current pins in [docker-compose.yml](/Volumes/dev_volume/vps-ai-stack/docker-compose.yml):
+Current pins in [docker-compose.yml](docker-compose.yml):
 
 - Traefik `v3.6.7`
 - Ollama `0.13.5`
@@ -249,7 +292,7 @@ Current pins in [docker-compose.yml](/Volumes/dev_volume/vps-ai-stack/docker-com
 To update intentionally:
 
 1. Review the upstream release notes for each service.
-2. Edit the image tags in [docker-compose.yml](/Volumes/dev_volume/vps-ai-stack/docker-compose.yml).
+2. Edit the image tags in [docker-compose.yml](docker-compose.yml).
 3. Take a backup with `bash scripts/backup.sh`.
 4. Run `docker compose pull`.
 5. Run `docker compose up -d`.
@@ -257,7 +300,19 @@ To update intentionally:
 
 ## Hardening Baseline
 
-This repository is a deployment template, not a full security program. At minimum, harden the VPS itself:
+This repository is a deployment template, not a full security program.
+
+What is now automated in the stack:
+
+- HTTPS termination through Traefik
+- baseline security headers on Open WebUI and n8n
+- baseline request rate limiting on Open WebUI and n8n
+- optional CIDR allowlist support for n8n via `N8N_IP_ALLOWLIST`
+- health and hardening audit scripts under `scripts/`
+
+`N8N_IP_ALLOWLIST` applies to the entire `automation.<domain>` host in this template, including editor access and incoming webhook traffic. Leave it blank if you need public webhook ingress.
+
+What is still manual on the host:
 
 - use SSH keys only
 - disable root SSH login
@@ -266,6 +321,12 @@ This repository is a deployment template, not a full security program. At minimu
 - install and enable fail2ban
 - enable unattended security updates
 - generate strong secrets instead of reusing example values
+
+To verify the host baseline after hardening:
+
+```bash
+sudo bash scripts/hardening-check.sh
+```
 
 Useful commands:
 
@@ -282,6 +343,32 @@ sudo dpkg-reconfigure -plow unattended-upgrades
 ```
 
 Do not describe this template as compliant, certified, or fully hardened unless you add and validate the controls required for your environment.
+
+## Monitoring Hooks
+
+Run the built-in health report manually:
+
+```bash
+bash scripts/health-report.sh
+```
+
+The report checks:
+
+- `docker compose ps`
+- core container status and health
+- disk usage against `HEALTH_DISK_WARN_PCT` and `HEALTH_DISK_FAIL_PCT`
+- presence of `acme.json` in the Traefik certificate volume
+
+The script exits non-zero when a critical issue is found.
+
+Example cron entries:
+
+```cron
+0 * * * * cd /opt/vps-ai-stack && bash scripts/health-report.sh >> /var/log/vps-ai-stack-health.log 2>&1
+15 2 * * * cd /opt/vps-ai-stack && bash scripts/backup.sh >> /var/log/vps-ai-stack-backup.log 2>&1
+```
+
+If you want alerting, point the health check cron output at your preferred mailer, logger, or webhook wrapper.
 
 ## Troubleshooting
 
@@ -333,7 +420,7 @@ What to do:
 
 ## License
 
-[AGPL-3.0](/Volumes/dev_volume/vps-ai-stack/LICENSE)
+[AGPL-3.0](LICENSE)
 
 ## Author
 

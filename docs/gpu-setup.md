@@ -29,7 +29,7 @@ sudo systemctl restart docker
 
 ## Enable GPU access in Compose
 
-Open [docker-compose.yml](/Volumes/dev_volume/vps-ai-stack/docker-compose.yml) and uncomment the `gpus: all` line under the `ollama` service:
+Open [docker-compose.yml](../docker-compose.yml) and uncomment the `gpus: all` line under the `ollama` service:
 
 ```yaml
 ollama:
