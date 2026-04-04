@@ -87,7 +87,7 @@ automation.example.com -> YOUR_VPS_IP
 ### 2. Clone the repo
 
 ```bash
-git clone https://github.com/yourusername/vps-ai-stack.git
+git clone https://github.com/L-Cocuy/vps-ai-stack.git
 cd vps-ai-stack
 ```
 
