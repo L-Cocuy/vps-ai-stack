@@ -75,6 +75,9 @@ docker compose config >/dev/null
 log "Pulling pinned images..."
 docker compose pull
 
+log "Building local OCR API image..."
+docker compose build ocr
+
 log "Starting the stack..."
 docker compose up -d
 

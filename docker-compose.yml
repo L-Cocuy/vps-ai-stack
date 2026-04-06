@@ -138,6 +138,8 @@ services:
       N8N_PERSONALIZATION_ENABLED: "false"
       N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS: "true"
       GENERIC_TIMEZONE: ${GENERIC_TIMEZONE:-UTC}
+      N8N_OLLAMA_BASE_URL: http://ollama:11434
+      N8N_OCR_BASE_URL: http://ocr:8081
     expose:
       - "5678"
     volumes:
@@ -168,6 +170,32 @@ services:
       - traefik.http.middlewares.n8n-rate-limit.ratelimit.average=50
       - traefik.http.middlewares.n8n-rate-limit.ratelimit.burst=25
       - traefik.http.middlewares.n8n-ip-allowlist.ipallowlist.sourcerange=${N8N_IP_ALLOWLIST:-127.0.0.1/32}
+
+  ocr:
+    build:
+      context: ./services/ocr-api
+      dockerfile: Dockerfile
+    container_name: ocr
+    init: true
+    restart: unless-stopped
+    environment:
+      OCR_LANGUAGES: ${OCR_LANGUAGES:-eng}
+      OCR_PDF_DIRECT_TEXT_MIN_CHARS: ${OCR_PDF_DIRECT_TEXT_MIN_CHARS:-80}
+      OCR_MAX_UPLOAD_MB: ${OCR_MAX_UPLOAD_MB:-20}
+      OCR_TIMEOUT_SECONDS: ${OCR_TIMEOUT_SECONDS:-600}
+      OCR_TESSERACT_PSM: ${OCR_TESSERACT_PSM:-4}
+      OCR_JOBS: ${OCR_JOBS:-2}
+      OCR_ALLOWED_PATHS: ${OCR_ALLOWED_PATHS:-/data/shared}
+    expose:
+      - "8081"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/health', timeout=5)\" >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+    networks:
+      - ai-stack
 
   postgres:
     image: postgres:16.13-alpine3.23

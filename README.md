@@ -2,7 +2,7 @@
 
 Practical self-hosted AI stack template for a single Linux VPS.
 
-Run Open WebUI, Ollama, n8n, Postgres, and Traefik with a simple Docker Compose workflow, HTTPS by default, and a few baseline ops scripts that are realistic for small consulting deployments.
+Run Open WebUI, Ollama, n8n, Postgres, Traefik, and an internal OCR API with a simple Docker Compose workflow, HTTPS by default, and baseline ops scripts that are realistic for small consulting deployments.
 
 ![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)
 ![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker)
@@ -19,6 +19,7 @@ Many SMB teams want private AI tools without handing internal data to a third-pa
 - Uses Let's Encrypt HTTP challenge for certificates.
 - Keeps service data in named Docker volumes.
 - Bootstraps two default Ollama models after the API is actually ready.
+- Runs an internal-only OCR microservice for PDFs and receipt images (`n8n -> OCR -> Ollama` workflow pattern).
 - Includes preflight, backup, restore, health, and hardening audit scripts for basic operations.
 
 ## What This Template Does Not Do
@@ -45,6 +46,11 @@ Many SMB teams want private AI tools without handing internal data to a third-pa
 │   ├── preflight.sh
 │   ├── restore.sh
 │   └── setup.sh
+├── services/
+│   └── ocr-api/
+│       ├── Dockerfile
+│       ├── main.py
+│       └── requirements.txt
 ├── docker-compose.yml
 ├── env.example
 └── README.md
@@ -56,6 +62,7 @@ Many SMB teams want private AI tools without handing internal data to a third-pa
 | [Ollama](https://ollama.com/) | Local LLM runtime | 11434 |
 | [Open WebUI](https://github.com/open-webui/open-webui) | Browser chat UI | 8080 |
 | [n8n](https://n8n.io/) | Workflow automation | 5678 |
+| OCR API (internal) | PDF/image text extraction service for n8n | 8081 |
 | [PostgreSQL](https://www.postgresql.org/) | n8n database backend | 5432 |
 
 ## Requirements
@@ -70,6 +77,7 @@ Many SMB teams want private AI tools without handing internal data to a third-pa
 
 Notes:
 - 4 GB RAM is workable for light use, but low-memory VPS plans will feel slow during model pulls and first inference.
+- OCR for scanned PDFs and receipt photos is CPU-intensive. For frequent OCR workloads, prefer 4 vCPU and 8-12 GB RAM.
 - First model downloads need extra disk headroom. The preflight script requires at least 20 GB free.
 - NVIDIA GPU support is optional. See [GPU setup](docs/gpu-setup.md).
 
@@ -129,7 +137,9 @@ The setup script will:
 - fail early if `.env` still contains placeholders
 - prepare the Traefik certificate volume and `acme.json` permissions
 - validate the Compose file
-- pull pinned images and start the stack
+- pull pinned images
+- build the local OCR API image
+- start the stack
 
 ### 5. Access the services
 
@@ -143,6 +153,7 @@ Expected first-start behavior:
 - Let's Encrypt can take 1 to 3 minutes after DNS is correct.
 - Ollama model bootstrap can take several minutes on the first run.
 - Open WebUI may not be usable until the default model pull finishes.
+- OCR image build on first run can add a few minutes depending on VPS network speed.
 
 ## Preflight Checks
 
@@ -179,6 +190,80 @@ docker exec ollama ollama pull qwen2.5-coder:7b
 ```
 
 Browse the Ollama model library at [ollama.com/library](https://ollama.com/library).
+
+## Internal API Endpoints for n8n
+
+Inside this Docker Compose network (`ai-stack`), n8n should use internal service DNS names:
+
+- Ollama base URL: `http://ollama:11434`
+- OCR API base URL: `http://ocr:8081`
+- n8n environment shortcuts: `N8N_OLLAMA_BASE_URL` and `N8N_OCR_BASE_URL`
+
+This is already consistent with the stack design:
+
+- `ollama`, `n8n`, and `ocr` share the same user-defined Docker network (`ai-stack`)
+- Ollama exposes port `11434` internally
+- OCR exposes port `8081` internally
+- neither Ollama nor OCR is published directly to the public internet
+
+The health script now checks both internal paths from the n8n container:
+
+- `http://ollama:11434/api/tags`
+- `http://ocr:8081/health`
+
+### OCR API contract
+
+Endpoint:
+
+```text
+POST http://ocr:8081/v1/extract
+Content-Type: multipart/form-data
+```
+
+Quick test from inside the Docker network:
+
+```bash
+docker run --rm --network ai-stack -v "$PWD:/work:ro" curlimages/curl:8.14.1 \
+  -sS -X POST http://ocr:8081/v1/extract \
+  -F "file=@/work/sample-receipt.jpg"
+```
+
+Request fields:
+
+- `file`: required for normal n8n usage (binary file upload)
+- `languages`: optional, defaults to `eng`
+- `file_path`: optional advanced mode (absolute path under `OCR_ALLOWED_PATHS`); requires you to add a shared mount, and must not be combined with `file`
+
+Example success response:
+
+```json
+{
+  "success": true,
+  "text": "extracted text...",
+  "source_type": "pdf",
+  "extraction_mode": "direct_text",
+  "mime_type": "application/pdf",
+  "character_count": 1234,
+  "confidence": null,
+  "warnings": [],
+  "error": null,
+  "processing_ms": 217
+}
+```
+
+Response behavior:
+
+- `extraction_mode=direct_text` for PDFs with sufficient embedded text
+- `extraction_mode=ocr` for scanned PDFs and image inputs
+- `confidence` is populated for image OCR when available (0.0-1.0); PDF OCR confidence is typically `null`
+- `warnings` explains fallback decisions and edge conditions
+
+### Recommended n8n pattern
+
+1. n8n ingests a receipt/document file.
+2. n8n sends the binary file to `POST http://ocr:8081/v1/extract`.
+3. OCR returns plain extracted text plus extraction metadata.
+4. n8n sends the extracted text to Ollama at `http://ollama:11434` for structured field extraction.
 
 ## Daily Operations
 
@@ -239,6 +324,13 @@ The backup script creates a timestamped folder under `backups/` and stores:
 - a copy of `.env`
 - `manifest.txt`
 
+OCR persistence note:
+
+- The OCR service is stateless in this template.
+- No OCR named volume is created.
+- Backup/restore scripts do not need OCR-specific volume changes.
+- Existing persisted volumes (`ollama_data`, `openwebui_data`, `n8n_data`, `postgres_data`, `traefik_certs`) remain unchanged.
+
 By default, backups stay local only. If you enable remote mode in `.env`, the script also:
 
 - creates an encrypted `tar.gz.enc` bundle of the timestamped backup folder
@@ -277,6 +369,50 @@ Remote restore is intentionally simple: download the encrypted archive, decrypt 
 
 Take a fresh backup before intentional upgrades.
 
+## Safe Upgrade for Existing Deployments
+
+For already-running stacks, use this conservative upgrade flow:
+
+1. Take a fresh backup first:
+
+   ```bash
+   bash scripts/backup.sh
+   ```
+
+2. Pull pinned upstream images:
+
+   ```bash
+   docker compose pull
+   ```
+
+3. Build the OCR API image (local Dockerfile) and recreate services:
+
+   ```bash
+   docker compose build ocr
+   docker compose up -d
+   ```
+
+4. Validate health:
+
+   ```bash
+   docker compose ps
+   bash scripts/health-report.sh
+   ```
+
+Why existing data remains intact:
+
+- Docker named volumes are separate from container lifecycles.
+- This upgrade does not rename or remove existing named volumes.
+- Existing service names and volume mappings for `n8n`, `Postgres`, `Open WebUI`, `Ollama`, and `Traefik` are preserved.
+- `docker compose pull` + `docker compose up -d` replaces containers but reattaches the same named volumes.
+
+When data could be lost or orphaned:
+
+- if you manually delete a named volume (`docker volume rm ...`)
+- if you change volume names in Compose without migrating data
+- if you run destructive cleanup commands that prune required volumes
+- if you restore from an incomplete or wrong backup set
+
 ## Image Versions
 
 This template pins explicit image versions instead of `latest` or `main`.
@@ -288,6 +424,7 @@ Current pins in [docker-compose.yml](docker-compose.yml):
 - Open WebUI `v0.7.2`
 - n8n `2.2.6`
 - Postgres `16.13-alpine3.23`
+- OCR API base image `python:3.12.11-slim-bookworm` with pinned Python dependencies in `services/ocr-api/requirements.txt`
 
 To update intentionally:
 
@@ -295,8 +432,9 @@ To update intentionally:
 2. Edit the image tags in [docker-compose.yml](docker-compose.yml).
 3. Take a backup with `bash scripts/backup.sh`.
 4. Run `docker compose pull`.
-5. Run `docker compose up -d`.
-6. Verify health with `docker compose ps` and `docker compose logs`.
+5. Rebuild local OCR image when OCR service code or dependencies changed: `docker compose build ocr`.
+6. Run `docker compose up -d`.
+7. Verify health with `docker compose ps`, `docker compose logs`, and `bash scripts/health-report.sh`.
 
 ## Hardening Baseline
 
@@ -356,6 +494,7 @@ The report checks:
 
 - `docker compose ps`
 - core container status and health
+- n8n internal connectivity to Ollama and OCR APIs
 - disk usage against `HEALTH_DISK_WARN_PCT` and `HEALTH_DISK_FAIL_PCT`
 - presence of `acme.json` in the Traefik certificate volume
 
@@ -417,6 +556,30 @@ What to do:
 - confirm the VPS still has free disk space
 - retry with `docker compose up -d ollama-bootstrap`
 - pull models manually with `docker exec ollama ollama pull <model>`
+
+### OCR returns empty or low-quality text
+
+Symptoms:
+- OCR responses contain very little text
+- receipt totals/vendor names are missing
+
+What to do:
+- ensure input files are high-contrast and not blurry
+- set `OCR_LANGUAGES` in `.env` if documents are not English
+- tune `OCR_TESSERACT_PSM` (for receipts, `4` or `6` are common)
+- review OCR warnings in the API response and adjust workflow retries
+
+### n8n cannot reach internal Ollama or OCR endpoint
+
+Symptoms:
+- n8n HTTP Request nodes to `http://ollama:11434` or `http://ocr:8081` fail
+- `scripts/health-report.sh` reports internal connectivity failures
+
+What to do:
+- run `docker compose ps` and confirm `ollama`, `n8n`, and `ocr` are running
+- verify all three services are attached to network `ai-stack`
+- check `docker compose logs n8n ollama ocr`
+- rerun `bash scripts/health-report.sh` after recovery
 
 ## License
 

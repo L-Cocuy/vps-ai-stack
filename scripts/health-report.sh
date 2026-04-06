@@ -12,6 +12,7 @@ CORE_SERVICES=(
   ollama
   open-webui
   n8n
+  ocr
 )
 CRITICAL_FAILURES=0
 WARNINGS=0
@@ -28,6 +29,29 @@ warn() {
 fail() {
   printf "[FAIL] %s\n" "$1"
   CRITICAL_FAILURES=$((CRITICAL_FAILURES + 1))
+}
+
+check_http_from_n8n() {
+  local target_name="$1"
+  local target_url="$2"
+  local n8n_container_id="$3"
+
+  if docker exec "${n8n_container_id}" node -e '
+const http = require("http");
+const target = process.argv[1];
+const req = http.get(target, (res) => {
+  process.exit(res.statusCode >= 200 && res.statusCode < 400 ? 0 : 1);
+});
+req.on("error", () => process.exit(1));
+req.setTimeout(5000, () => {
+  req.destroy();
+  process.exit(1);
+});
+' "${target_url}" >/dev/null 2>&1; then
+    pass "n8n can reach ${target_name} at ${target_url}."
+  else
+    fail "n8n cannot reach ${target_name} at ${target_url}."
+  fi
 }
 
 if [[ -f "${ENV_FILE}" ]]; then
@@ -107,6 +131,14 @@ if [[ -n "${bootstrap_id}" ]]; then
   fi
 else
   warn "ollama-bootstrap container was not found."
+fi
+
+n8n_id="$(docker compose ps -q n8n 2>/dev/null || true)"
+if [[ -n "${n8n_id}" ]]; then
+  check_http_from_n8n "Ollama API" "http://ollama:11434/api/tags" "${n8n_id}"
+  check_http_from_n8n "OCR API" "http://ocr:8081/health" "${n8n_id}"
+else
+  warn "n8n container is not available for internal connectivity checks."
 fi
 
 disk_used_pct="$(df -P "${REPO_ROOT}" | awk 'NR==2 {gsub("%", "", $5); print $5}')"
