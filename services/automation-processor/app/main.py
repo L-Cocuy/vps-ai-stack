@@ -10,7 +10,7 @@ from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException
 from PIL import Image, ImageOps, UnidentifiedImageError
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from pypdf import PdfReader
 import pytesseract
 
@@ -34,9 +34,35 @@ class FilePayload(BaseModel):
 
 class SourcePayload(BaseModel):
     channel: str
-    source_message_id: str | None = None
-    sender: str | None = None
-    source_user: str | None = None
+    source_message_id: str | int | None = None
+    sender: str | dict | list | None = None
+    source_user: str | dict | list | None = None
+    subject: str | dict | list | None = None
+
+    @staticmethod
+    def _stringify_source_value(value):
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (int, float, bool)):
+            return str(value)
+        if isinstance(value, dict):
+            for key in ("text", "email", "address", "name", "html", "value"):
+                if key in value and value[key] not in (None, ""):
+                    nested = SourcePayload._stringify_source_value(value[key])
+                    if nested:
+                        return nested
+            return str(value)
+        if isinstance(value, list):
+            parts = [SourcePayload._stringify_source_value(item) for item in value]
+            return ", ".join(part for part in parts if part)
+        return str(value)
+
+    @field_validator("source_message_id", "sender", "source_user", "subject", mode="before")
+    @classmethod
+    def normalize_source_strings(cls, value):
+        return cls._stringify_source_value(value)
 
 
 class StoragePayload(BaseModel):

@@ -137,7 +137,7 @@ services:
       - ai-stack
 
   n8n:
-    image: docker.n8n.io/n8nio/n8n:2.2.6
+    image: docker.n8n.io/n8nio/n8n:2.17.7
     container_name: n8n
     init: true
     restart: unless-stopped
@@ -161,10 +161,16 @@ services:
       N8N_DIAGNOSTICS_ENABLED: "false"
       N8N_PERSONALIZATION_ENABLED: "false"
       N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS: "true"
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
       GENERIC_TIMEZONE: ${GENERIC_TIMEZONE:-UTC}
       N8N_OLLAMA_BASE_URL: http://ollama:11434
       PROCESSOR_BASE_URL: http://automation-processor:8081
       PROCESSOR_SHARED_TOKEN: ${PROCESSOR_SHARED_TOKEN}
+      VD_RECEIPTS_DRIVE_FOLDER_ID: ${VD_RECEIPTS_DRIVE_FOLDER_ID}
+      VD_FINANCE_TRACKER_SHEET_ID: ${VD_FINANCE_TRACKER_SHEET_ID}
+      VD_FINANCE_TRACKER_RECEIPTS_TAB: ${VD_FINANCE_TRACKER_RECEIPTS_TAB:-receipts}
+      VD_RECEIPTS_GMAIL_QUERY: ${VD_RECEIPTS_GMAIL_QUERY:-label:vd/finance/receipts has:attachment}
+      VD_RECEIPTS_TELEGRAM_CHAT_IDS: ${VD_RECEIPTS_TELEGRAM_CHAT_IDS}
     expose:
       - "5678"
     volumes:
