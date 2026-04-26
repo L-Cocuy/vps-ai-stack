@@ -3,3 +3,5 @@ backups/
 *.log
 __pycache__/
 *.pyc
+
+*.code-workspace
