@@ -26,6 +26,23 @@ PDF_DIRECT_TEXT_MIN_CHARS = int(os.getenv("OCR_PDF_DIRECT_TEXT_MIN_CHARS", "80")
 OLLAMA_PROMPT_VERSION = "uc01-receipt-json-v1"
 MAX_UPLOAD_BYTES = int(os.getenv("OCR_MAX_UPLOAD_MB", "20")) * 1024 * 1024
 
+MONTHS = {
+    "january": "01",
+    "february": "02",
+    "march": "03",
+    "april": "04",
+    "may": "05",
+    "june": "06",
+    "july": "07",
+    "august": "08",
+    "september": "09",
+    "october": "10",
+    "november": "11",
+    "december": "12",
+}
+
+CURRENCY_SYMBOLS = {"€": "EUR", "$": "USD", "£": "GBP"}
+
 _SIGNATURE_TO_RECORD: dict[str, str] = {}
 _DEDUPE_LOCK = threading.Lock()
 
@@ -126,6 +143,15 @@ def _find_date(raw_text: str) -> str | None:
     if dotted:
         day, month, year = dotted.groups()
         return f"{year}-{month}-{day}"
+
+    english = re.search(
+        r"\b(" + "|".join(MONTHS) + r")\s+(\d{1,2}),\s*(20\d{2})\b",
+        raw_text,
+        re.IGNORECASE,
+    )
+    if english:
+        month_name, day, year = english.groups()
+        return f"{year}-{MONTHS[month_name.lower()]}-{int(day):02d}"
     return None
 
 
@@ -134,11 +160,19 @@ def _money_candidates(raw_text: str) -> list[tuple[str, float]]:
     patterns = [
         re.compile(r"\b(EUR|USD|GBP|CHF)\b[^\d]{0,8}([0-9][0-9.,]*)", re.IGNORECASE),
         re.compile(r"([0-9][0-9.,]*)[^\w]{0,3}\b(EUR|USD|GBP|CHF)\b", re.IGNORECASE),
+        re.compile(r"([€$£])\s*([0-9][0-9.,]*)"),
+        re.compile(r"([0-9][0-9.,]*)\s*([€$£])"),
     ]
     for pattern in patterns:
         for match in pattern.finditer(raw_text):
             left, right = match.group(1), match.group(2)
-            if re.match(r"^[A-Za-z]{3}$", left):
+            if left in CURRENCY_SYMBOLS:
+                currency = CURRENCY_SYMBOLS[left]
+                number = right
+            elif right in CURRENCY_SYMBOLS:
+                currency = CURRENCY_SYMBOLS[right]
+                number = left
+            elif re.match(r"^[A-Za-z]{3}$", left):
                 currency = left.upper()
                 number = right
             else:
@@ -176,6 +210,11 @@ def _extract_merchant(raw_text: str) -> str | None:
         "cropped",
         "paper slip",
         "receipt",
+        "page ",
+        "invoice number",
+        "receipt number",
+        "bill to",
+        "description",
     }
     for line in raw_text.splitlines():
         line = line.strip()
@@ -194,10 +233,10 @@ def _extract_merchant(raw_text: str) -> str | None:
 def _extract_tax(raw_text: str) -> float | None:
     for line in raw_text.splitlines():
         lowered = line.lower()
-        if any(token in lowered for token in ("mwst", "vat", "tax")):
-            nums = re.findall(r"([0-9][0-9.,]*)", line)
-            if nums:
-                parsed = _parse_decimal(nums[-1])
+        if any(token in lowered for token in ("mwst", "ust", "tax")) or ("vat" in lowered and any(symbol in line for symbol in ("€", "$", "£"))):
+            monetary = _money_candidates(line)
+            if monetary:
+                parsed = monetary[0][1]
                 if parsed is not None and parsed > 0:
                     return parsed
     return None
@@ -466,6 +505,23 @@ def _hints_dict(hints: HintsPayload | None) -> dict[str, Any]:
 
 def _apply_ollama_values(response: dict[str, Any], ollama_values: dict[str, Any]) -> dict[str, Any]:
     extracted = response["extracted"]
+    heuristic_amount = extracted.get("amount")
+    heuristic_tax_amount = extracted.get("tax_amount")
+
+    if (
+        ollama_values.get("amount") is not None
+        and heuristic_amount is not None
+        and ollama_values["amount"] > heuristic_amount * 10
+    ):
+        ollama_values["amount"] = heuristic_amount
+
+    if (
+        ollama_values.get("tax_amount") is not None
+        and heuristic_tax_amount is not None
+        and ollama_values["tax_amount"] > max(heuristic_tax_amount * 10, (ollama_values.get("amount") or heuristic_amount or 0))
+    ):
+        ollama_values["tax_amount"] = heuristic_tax_amount
+
     for key in ("merchant", "receipt_date", "amount", "currency"):
         if key in ollama_values and ollama_values[key] is not None:
             extracted[key] = ollama_values[key]
