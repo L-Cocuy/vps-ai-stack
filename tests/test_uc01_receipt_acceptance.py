@@ -286,6 +286,82 @@ davon 20,00% USt € 1,65 - Nettobetrag € 8,25
     assert body["extraction"]["engine"] == "ollama"
 
 
+def test_heuristic_fallback_handles_real_openai_invoice_when_ollama_is_unavailable(monkeypatch):
+    os.environ["PROCESSOR_SHARED_TOKEN"] = "test-token"
+    module = _load_module("automation_processor_openai_fallback_test")
+
+    def unavailable(raw_text, hints=None):
+        raise RuntimeError("ollama unavailable")
+
+    monkeypatch.setattr(module, "_call_ollama_extract", unavailable)
+    client = TestClient(module.app)
+    response = client.post(
+        "/v1/receipts/extract",
+        json=_receipt_payload(
+            """Page 1 of 1
+Receipt
+Invoice number 877B74AA-0031
+Receipt number 2604-9803-6736
+Date paid January 1, 2026
+OpenAI OpCo, LLC
+EU OSS VAT EU372041333
+Bill to Juan Pablo Mejia Nino
+$20.00 paid on January 1, 2026
+Description Qty Unit price Tax Amount""",
+            document_id="doc_openai_fallback",
+        ),
+        headers={"X-Processor-Token": "test-token"},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["extracted"]["merchant"] == "OpenAI OpCo, LLC"
+    assert body["extracted"]["receipt_date"] == "2026-01-01"
+    assert body["extracted"]["amount"] == 20.0
+    assert body["extracted"]["currency"] == "EUR"  # hint wins in fallback mode
+    assert body["extracted"]["tax_amount"] is None
+    assert body["extraction"]["engine"] == "heuristic"
+    assert body["extraction"]["fallback_used"] is True
+
+
+def test_heuristic_fallback_handles_real_spusu_invoice_when_ollama_is_unavailable(monkeypatch):
+    os.environ["PROCESSOR_SHARED_TOKEN"] = "test-token"
+    module = _load_module("automation_processor_spusu_fallback_test")
+
+    def unavailable(raw_text, hints=None):
+        raise RuntimeError("ollama unavailable")
+
+    monkeypatch.setattr(module, "_call_ollama_extract", unavailable)
+    client = TestClient(module.app)
+    response = client.post(
+        "/v1/receipts/extract",
+        json=_receipt_payload(
+            """spusu
+DC Tower 1, 45. Stock
+Donau-City-Straße 7
+1220 Wien
+Rechnung Wien, 01.04.2026
+Kundennummer: 4360507
+Belegnummer: SR-2140225/2026
+1 spusu 5G 12.000 0676 347 9670 Juan Mejia € 9,90
+Gesamtbetrag inkl. USt
+davon 20,00% USt € 1,65 - Nettobetrag € 8,25
+€ 9,90""",
+            document_id="doc_spusu_fallback",
+        ),
+        headers={"X-Processor-Token": "test-token"},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["extracted"]["merchant"] == "spusu"
+    assert body["extracted"]["receipt_date"] == "2026-04-01"
+    assert body["extracted"]["amount"] == 9.90
+    assert body["extracted"]["tax_amount"] == 1.65
+    assert body["extraction"]["engine"] == "heuristic"
+    assert body["extraction"]["fallback_used"] is True
+
+
 def test_processor_rejects_missing_or_wrong_shared_token():
     client = _client()
     payload = _receipt_payload("ACME\nTotal EUR 10.00")
