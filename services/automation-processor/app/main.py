@@ -1,13 +1,14 @@
 import base64
 import hashlib
 import json
+import logging
 import os
 import re
 import threading
 import urllib.error
 import urllib.request
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from io import BytesIO
 from typing import Any
 
@@ -23,9 +24,18 @@ DEFAULT_CURRENCY = os.getenv("DEFAULT_CURRENCY", "EUR")
 DEFAULT_LANGUAGES = os.getenv("OCR_LANGUAGES", "eng+deu")
 PDF_DIRECT_TEXT_MIN_CHARS = int(os.getenv("OCR_PDF_DIRECT_TEXT_MIN_CHARS", "80"))
 OLLAMA_PROMPT_VERSION = "uc01-receipt-json-v1"
+MAX_UPLOAD_BYTES = int(os.getenv("OCR_MAX_UPLOAD_MB", "20")) * 1024 * 1024
 
 _SIGNATURE_TO_RECORD: dict[str, str] = {}
 _DEDUPE_LOCK = threading.Lock()
+
+_logger = logging.getLogger("automation-processor")
+
+if not os.getenv("PROCESSOR_SHARED_TOKEN", "").strip():
+    _logger.warning(
+        "PROCESSOR_SHARED_TOKEN is not set — /v1/receipts/extract is unauthenticated. "
+        "Set this variable before deploying."
+    )
 
 app = FastAPI(title="automation-processor", version="0.1.0")
 
@@ -235,6 +245,11 @@ def _text_from_image(raw: bytes, languages: str) -> str:
 
 def _extract_raw_text(payload: ReceiptExtractRequest) -> str:
     raw = _decode_file_bytes(payload.file.content_base64)
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail={"error_code": "file_too_large", "message": f"File exceeds {MAX_UPLOAD_BYTES // (1024 * 1024)} MB limit"},
+        )
     mime_type = (payload.file.mime_type or "").lower()
     languages = DEFAULT_LANGUAGES
 
@@ -242,8 +257,9 @@ def _extract_raw_text(payload: ReceiptExtractRequest) -> str:
         text = _text_from_pdf(raw)
         if len(text) >= PDF_DIRECT_TEXT_MIN_CHARS:
             return text
-        # Phase 1 fallback: direct PDF text is enough for digital receipts; scanned PDFs can still be reviewed.
-        return text or raw.decode("utf-8", errors="ignore").strip()
+        # Scanned PDFs with insufficient extractable text: return what we have (may be empty).
+        # The review flow catches this via ocr_quality_poor. Full scanned-PDF rendering is a phase-2 gap.
+        return text
 
     if mime_type.startswith("image/"):
         return _text_from_image(raw, languages)
@@ -437,16 +453,14 @@ def _heuristic_extract(raw_text: str, payload: ReceiptExtractRequest) -> dict[st
         },
         "raw_text": raw_text,
         "schema_version": SCHEMA_VERSION,
-        "processed_at": datetime.utcnow().isoformat() + "Z",
+        "processed_at": datetime.now(timezone.utc).isoformat(),
     }
 
 
 def _hints_dict(hints: HintsPayload | None) -> dict[str, Any]:
     if hints is None:
         return {}
-    if hasattr(hints, "model_dump"):
-        return {key: value for key, value in hints.model_dump().items() if value is not None}
-    return {key: value for key, value in hints.dict().items() if value is not None}
+    return {key: value for key, value in hints.model_dump().items() if value is not None}
 
 
 def _apply_ollama_values(response: dict[str, Any], ollama_values: dict[str, Any]) -> dict[str, Any]:
