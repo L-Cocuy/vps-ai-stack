@@ -438,6 +438,7 @@ def _heuristic_extract(raw_text: str, payload: ReceiptExtractRequest) -> dict[st
         "classification": {
             "category_suggestion": category_suggestion,
             "business_relevance_note": category_reason,
+            "category_reason": category_reason,
         },
         "confidence": {
             "overall": overall,
@@ -475,6 +476,7 @@ def _apply_ollama_values(response: dict[str, Any], ollama_values: dict[str, Any]
     if ollama_values.get("category_suggestion"):
         response["classification"]["category_suggestion"] = ollama_values["category_suggestion"]
     if ollama_values.get("business_relevance_note"):
+        response["classification"]["business_relevance_note"] = ollama_values["business_relevance_note"]
         response["classification"]["category_reason"] = ollama_values["business_relevance_note"]
 
     confidence = ollama_values.get("confidence")
