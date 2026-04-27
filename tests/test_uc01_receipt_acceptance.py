@@ -36,14 +36,18 @@ REQUIRED_SHEET_COLUMNS = [
 ]
 
 
-def _load_app():
+def _load_module(module_name="automation_processor_main"):
     assert SERVICE_MAIN.exists(), "UC01 requires services/automation-processor/app/main.py"
     sys.path.insert(0, str(SERVICE_MAIN.parent.parent))
-    spec = importlib.util.spec_from_file_location("automation_processor_main", SERVICE_MAIN)
+    spec = importlib.util.spec_from_file_location(module_name, SERVICE_MAIN)
     module = importlib.util.module_from_spec(spec)
     assert spec and spec.loader
     spec.loader.exec_module(module)
-    return module.app
+    return module
+
+
+def _load_app():
+    return _load_module().app
 
 
 def _client():
@@ -160,6 +164,124 @@ def test_duplicate_hint_is_stable_for_same_receipt_signature():
     body = second.json()
     assert body["dedupe"]["suspected_duplicate"] is True
     assert body["dedupe"]["matched_record_id"] == first.json()["stored_record_id"]
+
+
+def test_ollama_structuring_corrects_openai_invoice_ocr_that_heuristics_misread(monkeypatch):
+    os.environ["PROCESSOR_SHARED_TOKEN"] = "test-token"
+    os.environ["OLLAMA_MODEL"] = "llama3.2"
+    module = _load_module("automation_processor_openai_ocr_test")
+    calls = []
+
+    def fake_ollama_extract(raw_text, hints=None):
+        calls.append(raw_text)
+        return {
+            "merchant": "OpenAI OpCo, LLC",
+            "receipt_date": "2026-01-01",
+            "amount": 20.00,
+            "currency": "USD",
+            "tax_amount": None,
+            "payment_method": "card",
+            "category_suggestion": "software",
+            "business_relevance_note": "OpenAI subscription/API invoice",
+            "confidence": 0.93,
+            "review_required": False,
+            "review_reasons": [],
+        }
+
+    monkeypatch.setattr(module, "_call_ollama_extract", fake_ollama_extract)
+    client = TestClient(module.app)
+    response = client.post(
+        "/v1/receipts/extract",
+        json=_receipt_payload(
+            """Page 1 of 1
+Receipt
+Invoice number 877B74AA-0031
+Receipt number 2604-9803-6736
+Date paid January 1, 2026
+OpenAI OpCo, LLC
+EU OSS VAT EU372041333
+Bill to Juan Pablo Mejia Nino
+$20.00 paid on January 1, 2026
+Description Qty Unit price Tax Amount""",
+            document_id="doc_openai_real_ocr",
+            source_channel="telegram",
+        ),
+        headers={"X-Processor-Token": "test-token"},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert calls, "processor must route OCR text through Ollama before filling the finance fields"
+    assert body["extracted"] == {
+        "merchant": "OpenAI OpCo, LLC",
+        "receipt_date": "2026-01-01",
+        "amount": 20.0,
+        "currency": "USD",
+        "tax_amount": None,
+        "payment_method": "card",
+    }
+    assert body["classification"]["category_suggestion"] == "software"
+    assert body["classification"]["category_reason"] == "OpenAI subscription/API invoice"
+    assert body["confidence"]["overall"] >= 0.9
+    assert body["review"]["required"] is False
+    assert body["extraction"]["engine"] == "ollama"
+    assert body["extraction"]["model"] == "llama3.2"
+
+
+def test_ollama_structuring_extracts_spusu_total_from_real_ocr(monkeypatch):
+    os.environ["PROCESSOR_SHARED_TOKEN"] = "test-token"
+    module = _load_module("automation_processor_spusu_ocr_test")
+    calls = []
+
+    def fake_ollama_extract(raw_text, hints=None):
+        calls.append(raw_text)
+        return {
+            "merchant": "spusu",
+            "receipt_date": "2026-04-01",
+            "amount": 9.90,
+            "currency": "EUR",
+            "tax_amount": 1.65,
+            "payment_method": None,
+            "category_suggestion": "telecom",
+            "business_relevance_note": "Mobile phone service invoice",
+            "confidence": 0.91,
+            "review_required": False,
+            "review_reasons": [],
+        }
+
+    monkeypatch.setattr(module, "_call_ollama_extract", fake_ollama_extract)
+    client = TestClient(module.app)
+    response = client.post(
+        "/v1/receipts/extract",
+        json=_receipt_payload(
+            """spusu
+DC Tower 1, 45. Stock
+Donau-City-Straße 7
+1220 Wien
+Rechnung Wien, 01.04.2026
+Kundennummer: 4360507
+Belegnummer: SR-2140225/2026
+1 spusu 5G 12.000 0676 347 9670 Juan Mejia € 9,90
+Gesamtbetrag inkl. USt
+davon 20,00% USt € 1,65 - Nettobetrag € 8,25
+€ 9,90""",
+            document_id="doc_spusu_real_ocr",
+            source_channel="gmail",
+        ),
+        headers={"X-Processor-Token": "test-token"},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert calls, "processor must route OCR text through Ollama before filling the finance fields"
+    assert body["extracted"]["merchant"] == "spusu"
+    assert body["extracted"]["receipt_date"] == "2026-04-01"
+    assert body["extracted"]["amount"] == 9.90
+    assert body["extracted"]["tax_amount"] == 1.65
+    assert body["classification"]["category_suggestion"] == "telecom"
+    assert body["classification"]["category_reason"] == "Mobile phone service invoice"
+    assert body["review"]["required"] is False
+    assert body["extraction"]["engine"] == "ollama"
 
 
 def test_processor_rejects_missing_or_wrong_shared_token():
