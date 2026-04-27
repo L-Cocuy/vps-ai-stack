@@ -222,6 +222,7 @@ Description Qty Unit price Tax Amount""",
     }
     assert body["classification"]["category_suggestion"] == "software"
     assert body["classification"]["category_reason"] == "OpenAI subscription/API invoice"
+    assert body["classification"]["business_relevance_note"] == "OpenAI subscription/API invoice"
     assert body["confidence"]["overall"] >= 0.9
     assert body["review"]["required"] is False
     assert body["extraction"]["engine"] == "ollama"
@@ -280,6 +281,7 @@ davon 20,00% USt € 1,65 - Nettobetrag € 8,25
     assert body["extracted"]["tax_amount"] == 1.65
     assert body["classification"]["category_suggestion"] == "telecom"
     assert body["classification"]["category_reason"] == "Mobile phone service invoice"
+    assert body["classification"]["business_relevance_note"] == "Mobile phone service invoice"
     assert body["review"]["required"] is False
     assert body["extraction"]["engine"] == "ollama"
 
