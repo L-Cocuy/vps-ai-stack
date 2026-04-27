@@ -119,6 +119,9 @@ services:
     container_name: automation-processor
     init: true
     restart: unless-stopped
+    depends_on:
+      ollama:
+        condition: service_healthy
     environment:
       PROCESSOR_SHARED_TOKEN: ${PROCESSOR_SHARED_TOKEN}
       OLLAMA_BASE_URL: http://ollama:11434

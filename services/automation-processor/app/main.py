@@ -1,10 +1,14 @@
 import base64
 import hashlib
+import json
+import logging
 import os
 import re
 import threading
+import urllib.error
+import urllib.request
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from io import BytesIO
 from typing import Any
 
@@ -19,9 +23,19 @@ CONFIDENCE_REVIEW_THRESHOLD = 0.75
 DEFAULT_CURRENCY = os.getenv("DEFAULT_CURRENCY", "EUR")
 DEFAULT_LANGUAGES = os.getenv("OCR_LANGUAGES", "eng+deu")
 PDF_DIRECT_TEXT_MIN_CHARS = int(os.getenv("OCR_PDF_DIRECT_TEXT_MIN_CHARS", "80"))
+OLLAMA_PROMPT_VERSION = "uc01-receipt-json-v1"
+MAX_UPLOAD_BYTES = int(os.getenv("OCR_MAX_UPLOAD_MB", "20")) * 1024 * 1024
 
 _SIGNATURE_TO_RECORD: dict[str, str] = {}
 _DEDUPE_LOCK = threading.Lock()
+
+_logger = logging.getLogger("automation-processor")
+
+if not os.getenv("PROCESSOR_SHARED_TOKEN", "").strip():
+    _logger.warning(
+        "PROCESSOR_SHARED_TOKEN is not set — /v1/receipts/extract is unauthenticated. "
+        "Set this variable before deploying."
+    )
 
 app = FastAPI(title="automation-processor", version="0.1.0")
 
@@ -231,6 +245,11 @@ def _text_from_image(raw: bytes, languages: str) -> str:
 
 def _extract_raw_text(payload: ReceiptExtractRequest) -> str:
     raw = _decode_file_bytes(payload.file.content_base64)
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail={"error_code": "file_too_large", "message": f"File exceeds {MAX_UPLOAD_BYTES // (1024 * 1024)} MB limit"},
+        )
     mime_type = (payload.file.mime_type or "").lower()
     languages = DEFAULT_LANGUAGES
 
@@ -238,8 +257,9 @@ def _extract_raw_text(payload: ReceiptExtractRequest) -> str:
         text = _text_from_pdf(raw)
         if len(text) >= PDF_DIRECT_TEXT_MIN_CHARS:
             return text
-        # Phase 1 fallback: direct PDF text is enough for digital receipts; scanned PDFs can still be reviewed.
-        return text or raw.decode("utf-8", errors="ignore").strip()
+        # Scanned PDFs with insufficient extractable text: return what we have (may be empty).
+        # The review flow catches this via ocr_quality_poor. Full scanned-PDF rendering is a phase-2 gap.
+        return text
 
     if mime_type.startswith("image/"):
         return _text_from_image(raw, languages)
@@ -250,8 +270,100 @@ def _extract_raw_text(payload: ReceiptExtractRequest) -> str:
     return raw.decode("latin-1", errors="ignore").strip()
 
 
-def _extract_structured(payload: ReceiptExtractRequest) -> dict[str, Any]:
-    raw_text = _extract_raw_text(payload)
+def _json_type_name(value: Any) -> str:
+    return type(value).__name__
+
+
+def _normalize_ollama_extract(candidate: Any) -> dict[str, Any]:
+    if not isinstance(candidate, dict):
+        raise ValueError(f"Ollama extraction must be a JSON object, got {_json_type_name(candidate)}")
+
+    allowed_payment_methods = {"card", "cash", "bank_transfer", "other"}
+    normalized: dict[str, Any] = {}
+
+    for key in ("merchant", "receipt_date", "currency", "payment_method", "category_suggestion", "business_relevance_note"):
+        value = candidate.get(key)
+        normalized[key] = value.strip() if isinstance(value, str) and value.strip() else None
+
+    if normalized["receipt_date"] and not re.fullmatch(r"20\d{2}-\d{2}-\d{2}", normalized["receipt_date"]):
+        normalized["receipt_date"] = None
+
+    if normalized["currency"]:
+        normalized["currency"] = normalized["currency"].upper()
+        if not re.fullmatch(r"[A-Z]{3}", normalized["currency"]):
+            normalized["currency"] = None
+
+    if normalized["payment_method"] and normalized["payment_method"] not in allowed_payment_methods:
+        normalized["payment_method"] = "other"
+
+    for key in ("amount", "tax_amount", "confidence"):
+        value = candidate.get(key)
+        if value is None or value == "":
+            normalized[key] = None
+            continue
+        if isinstance(value, str):
+            value = _parse_decimal(value)
+        try:
+            normalized[key] = round(float(value), 2)
+        except (TypeError, ValueError):
+            normalized[key] = None
+
+    if normalized["confidence"] is not None:
+        normalized["confidence"] = max(0.0, min(1.0, float(normalized["confidence"])))
+
+    normalized["review_required"] = bool(candidate.get("review_required", False))
+    review_reasons = candidate.get("review_reasons") or []
+    if isinstance(review_reasons, str):
+        review_reasons = [review_reasons]
+    if not isinstance(review_reasons, list):
+        review_reasons = []
+    normalized["review_reasons"] = sorted({str(reason).strip() for reason in review_reasons if str(reason).strip()})
+    return normalized
+
+
+def _call_ollama_extract(raw_text: str, hints: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    """Ask local Ollama to structure receipt OCR text as strict JSON.
+
+    The processor remains credential-free and internal-only; this calls the local Ollama API on the Docker network.
+    """
+    base_url = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434").rstrip("/")
+    model = os.getenv("OLLAMA_MODEL", "llama3.2")
+    timeout = float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "45"))
+    hints = hints or {}
+    prompt = f"""You extract accounting fields from receipt OCR text.
+Return ONLY one valid JSON object. Do not include markdown or commentary.
+Use null when unsure. Do not invent values.
+Normalize receipt_date as ISO YYYY-MM-DD. Normalize amount/tax_amount as numbers. Normalize currency as ISO 4217.
+Allowed payment_method values: card, cash, bank_transfer, other, null.
+Required JSON keys: merchant, receipt_date, amount, currency, tax_amount, payment_method, category_suggestion, business_relevance_note, confidence, review_required, review_reasons.
+confidence must be a number from 0 to 1. review_reasons must be an array of machine-readable strings.
+Hints JSON: {json.dumps(hints, ensure_ascii=False)}
+OCR text:
+{raw_text[:12000]}
+"""
+    request_body = json.dumps({"model": model, "prompt": prompt, "stream": False, "format": "json"}).encode("utf-8")
+    request = urllib.request.Request(
+        f"{base_url}/api/generate",
+        data=request_body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"ollama_request_failed: {exc}") from exc
+
+    content = payload.get("response", payload)
+    if isinstance(content, str):
+        try:
+            content = json.loads(content)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"ollama_invalid_json: {exc}") from exc
+    return _normalize_ollama_extract(content)
+
+
+def _heuristic_extract(raw_text: str, payload: ReceiptExtractRequest) -> dict[str, Any]:
     merchant = _extract_merchant(raw_text)
     receipt_date = _find_date(raw_text)
 
@@ -341,8 +453,76 @@ def _extract_structured(payload: ReceiptExtractRequest) -> dict[str, Any]:
         },
         "raw_text": raw_text,
         "schema_version": SCHEMA_VERSION,
-        "processed_at": datetime.utcnow().isoformat() + "Z",
+        "processed_at": datetime.now(timezone.utc).isoformat(),
     }
+
+
+def _hints_dict(hints: HintsPayload | None) -> dict[str, Any]:
+    if hints is None:
+        return {}
+    return {key: value for key, value in hints.model_dump().items() if value is not None}
+
+
+def _apply_ollama_values(response: dict[str, Any], ollama_values: dict[str, Any]) -> dict[str, Any]:
+    extracted = response["extracted"]
+    for key in ("merchant", "receipt_date", "amount", "currency"):
+        if key in ollama_values and ollama_values[key] is not None:
+            extracted[key] = ollama_values[key]
+    for key in ("tax_amount", "payment_method"):
+        if key in ollama_values:
+            extracted[key] = ollama_values[key]
+
+    if ollama_values.get("category_suggestion"):
+        response["classification"]["category_suggestion"] = ollama_values["category_suggestion"]
+    if ollama_values.get("business_relevance_note"):
+        response["classification"]["category_reason"] = ollama_values["business_relevance_note"]
+
+    confidence = ollama_values.get("confidence")
+    if confidence is not None:
+        response["confidence"]["overall"] = round(float(confidence), 2)
+        response["confidence"]["field_scores"] = {
+            "merchant": 0.95 if extracted.get("merchant") else 0.2,
+            "receipt_date": 0.95 if extracted.get("receipt_date") else 0.2,
+            "amount": 0.98 if extracted.get("amount") is not None else 0.2,
+            "tax_amount": 0.8 if extracted.get("tax_amount") is not None else 0.55,
+        }
+
+    review_reasons = list(ollama_values.get("review_reasons") or [])
+    if response["confidence"]["overall"] < CONFIDENCE_REVIEW_THRESHOLD and "low_confidence" not in review_reasons:
+        review_reasons.append("low_confidence")
+    response["review"] = {
+        "required": bool(ollama_values.get("review_required", False) or review_reasons),
+        "reason_codes": sorted(set(review_reasons)),
+    }
+    return response
+
+
+def _extract_structured(payload: ReceiptExtractRequest) -> dict[str, Any]:
+    raw_text = _extract_raw_text(payload)
+    response = _heuristic_extract(raw_text, payload)
+    model = os.getenv("OLLAMA_MODEL", "llama3.2")
+
+    try:
+        ollama_values = _call_ollama_extract(raw_text, _hints_dict(payload.hints))
+        if not ollama_values:
+            raise ValueError("ollama_empty_response")
+        response = _apply_ollama_values(response, ollama_values)
+        response["extraction"] = {
+            "engine": "ollama",
+            "model": model,
+            "prompt_version": OLLAMA_PROMPT_VERSION,
+            "fallback_used": False,
+        }
+    except Exception as exc:  # noqa: BLE001 - fallback must be resilient for phase-1 automation
+        response["extraction"] = {
+            "engine": "heuristic",
+            "model": model,
+            "prompt_version": OLLAMA_PROMPT_VERSION,
+            "fallback_used": True,
+            "fallback_reason": str(exc),
+        }
+
+    return response
 
 
 def _verify_shared_token(x_processor_token: str | None) -> None:
