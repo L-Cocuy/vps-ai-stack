@@ -218,7 +218,7 @@ Description Qty Unit price Tax Amount""",
         "amount": 20.0,
         "currency": "USD",
         "tax_amount": None,
-        "payment_method": "card",
+        "payment_method": None,
     }
     assert body["classification"]["category_suggestion"] == "software"
     assert body["classification"]["category_reason"] == "OpenAI subscription/API invoice"
@@ -597,3 +597,177 @@ $20.00 paid on January 1, 2026""",
     body = response.json()
     assert body["review"]["required"] is False
     assert body["review"]["reason_codes"] == []
+
+
+def test_ollama_voting_prefers_consensus_with_valid_evidence(monkeypatch):
+    os.environ["PROCESSOR_SHARED_TOKEN"] = "test-token"
+    os.environ["OLLAMA_VOTE_ATTEMPTS"] = "3"
+    module = _load_module("automation_processor_voting_consensus_test")
+    calls = []
+    candidates = iter([
+        {
+            "merchant": "Wien",
+            "receipt_date": "2026-04-01",
+            "amount": 12.00,
+            "currency": "EUR",
+            "tax_amount": 1.65,
+            "payment_method": None,
+            "category_suggestion": "telecom",
+            "business_relevance_note": "Mobile phone service invoice",
+            "confidence": 0.80,
+            "review_required": True,
+            "review_reasons": ["uncertain merchant name"],
+            "evidence": {"merchant": "Rechnung Wien, 01.04.2026", "amount": "spusu 5G 12.000"},
+        },
+        {
+            "merchant": "spusu",
+            "receipt_date": "2026-04-01",
+            "amount": 9.90,
+            "currency": "EUR",
+            "tax_amount": 1.65,
+            "payment_method": None,
+            "category_suggestion": "telecom",
+            "business_relevance_note": "Mobile phone service invoice",
+            "confidence": 0.92,
+            "review_required": False,
+            "review_reasons": [],
+            "evidence": {"merchant": "spusu", "amount": "€ 9,90", "tax_amount": "USt € 1,65"},
+        },
+        {
+            "merchant": "spusu",
+            "receipt_date": "2026-04-01",
+            "amount": 9.90,
+            "currency": "EUR",
+            "tax_amount": 1.65,
+            "payment_method": None,
+            "category_suggestion": "telecom",
+            "business_relevance_note": "Mobile phone service invoice",
+            "confidence": 0.91,
+            "review_required": False,
+            "review_reasons": [],
+            "evidence": {"merchant": "spusu", "amount": "Gesamtbetrag inkl. USt € 9,90", "tax_amount": "USt € 1,65"},
+        },
+    ])
+
+    def fake_ollama_extract(raw_text, hints=None):
+        calls.append(raw_text)
+        return next(candidates)
+
+    monkeypatch.setattr(module, "_call_ollama_extract", fake_ollama_extract)
+    client = TestClient(module.app)
+    response = client.post(
+        "/v1/receipts/extract",
+        json=_receipt_payload(
+            """spusu
+DC Tower 1, 45. Stock
+Donau-City-Straße 7
+1220 Wien
+Rechnung Wien, 01.04.2026
+1 spusu 5G 12.000 Juan Mejia € 9,90
+Gesamtbetrag inkl. USt
+davon 20,00% USt € 1,65 - Nettobetrag € 8,25
+€ 9,90""",
+            document_id="doc_spusu_voting",
+        ),
+        headers={"X-Processor-Token": "test-token"},
+    )
+
+    os.environ.pop("OLLAMA_VOTE_ATTEMPTS", None)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert len(calls) == 3
+    assert body["extracted"]["merchant"] == "spusu"
+    assert body["extracted"]["amount"] == 9.90
+    assert body["extracted"]["tax_amount"] == 1.65
+    assert body["classification"]["category_suggestion"] == "telecom"
+    assert body["review"]["required"] is False
+    assert body["extraction"]["vote_attempts"] == 3
+
+
+def test_ollama_evidence_validation_rejects_amount_not_supported_by_money_text(monkeypatch):
+    os.environ["PROCESSOR_SHARED_TOKEN"] = "test-token"
+    os.environ["OLLAMA_VOTE_ATTEMPTS"] = "1"
+    module = _load_module("automation_processor_evidence_amount_guard_test")
+
+    def fake_ollama_extract(raw_text, hints=None):
+        return {
+            "merchant": "spusu",
+            "receipt_date": "2026-04-01",
+            "amount": 12.00,
+            "currency": "EUR",
+            "tax_amount": 1.65,
+            "payment_method": None,
+            "category_suggestion": "telecom",
+            "business_relevance_note": "Mobile phone service invoice",
+            "confidence": 0.91,
+            "review_required": False,
+            "review_reasons": [],
+            "evidence": {"merchant": "spusu", "amount": "spusu 5G 12.000", "tax_amount": "USt € 1,65"},
+        }
+
+    monkeypatch.setattr(module, "_call_ollama_extract", fake_ollama_extract)
+    client = TestClient(module.app)
+    response = client.post(
+        "/v1/receipts/extract",
+        json=_receipt_payload(
+            """spusu
+Rechnung Wien, 01.04.2026
+1 spusu 5G 12.000 Juan Mejia € 9,90
+Gesamtbetrag inkl. USt
+davon 20,00% USt € 1,65 - Nettobetrag € 8,25
+€ 9,90""",
+            document_id="doc_spusu_evidence_guard",
+        ),
+        headers={"X-Processor-Token": "test-token"},
+    )
+
+    os.environ.pop("OLLAMA_VOTE_ATTEMPTS", None)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["extracted"]["merchant"] == "spusu"
+    assert body["extracted"]["amount"] == 9.90
+    assert body["extracted"]["tax_amount"] == 1.65
+    assert body["review"]["required"] is False
+
+
+def test_ollama_payment_method_needs_raw_text_support(monkeypatch):
+    os.environ["PROCESSOR_SHARED_TOKEN"] = "test-token"
+    os.environ["OLLAMA_VOTE_ATTEMPTS"] = "1"
+    module = _load_module("automation_processor_payment_method_guard_test")
+
+    def fake_ollama_extract(raw_text, hints=None):
+        return {
+            "merchant": "spusu",
+            "receipt_date": "2026-04-01",
+            "amount": 9.90,
+            "currency": "EUR",
+            "tax_amount": 1.65,
+            "payment_method": "cash",
+            "category_suggestion": "telecom",
+            "business_relevance_note": "Mobile phone service invoice",
+            "confidence": 0.91,
+            "review_required": False,
+            "review_reasons": [],
+            "evidence": {"merchant": "spusu", "amount": "€ 9,90", "tax_amount": "USt € 1,65"},
+        }
+
+    monkeypatch.setattr(module, "_call_ollama_extract", fake_ollama_extract)
+    client = TestClient(module.app)
+    response = client.post(
+        "/v1/receipts/extract",
+        json=_receipt_payload(
+            """spusu
+Rechnung Wien, 01.04.2026
+1 spusu 5G 12.000 Juan Mejia € 9,90
+Gesamtbetrag inkl. USt
+davon 20,00% USt € 1,65 - Nettobetrag € 8,25
+€ 9,90""",
+            document_id="doc_payment_method_guard",
+        ),
+        headers={"X-Processor-Token": "test-token"},
+    )
+
+    os.environ.pop("OLLAMA_VOTE_ATTEMPTS", None)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["extracted"]["payment_method"] is None
