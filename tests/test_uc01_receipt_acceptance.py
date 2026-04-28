@@ -509,3 +509,91 @@ davon 20,00% USt € 1,65 - Nettobetrag € 8,25
     assert body["classification"]["category_suggestion"] == "telecom"
     assert body["classification"]["business_relevance_note"] == "Mobile/telecom service invoice"
     assert body["classification"]["category_reason"] == "Mobile/telecom service invoice"
+
+
+
+def test_ollama_cannot_overwrite_sane_spusu_merchant_or_amount_with_bad_values(monkeypatch):
+    os.environ["PROCESSOR_SHARED_TOKEN"] = "test-token"
+    module = _load_module("automation_processor_spusu_value_guard_test")
+
+    def fake_ollama_extract(raw_text, hints=None):
+        return {
+            "merchant": "Wien",
+            "receipt_date": "2026-04-01",
+            "amount": 92.50,
+            "currency": "EUR",
+            "tax_amount": 1.65,
+            "payment_method": None,
+            "category_suggestion": "telecom",
+            "business_relevance_note": "Mobile phone service invoice",
+            "confidence": 0.91,
+            "review_required": True,
+            "review_reasons": ["uncertain merchant name"],
+        }
+
+    monkeypatch.setattr(module, "_call_ollama_extract", fake_ollama_extract)
+    client = TestClient(module.app)
+    response = client.post(
+        "/v1/receipts/extract",
+        json=_receipt_payload(
+            """spusu
+DC Tower 1, 45. Stock
+Donau-City-Straße 7
+1220 Wien
+Rechnung Wien, 01.04.2026
+1 spusu 5G 12.000 Juan Mejia € 9,90
+Gesamtbetrag inkl. USt
+davon 20,00% USt € 1,65 - Nettobetrag € 8,25
+€ 9,90""",
+            document_id="doc_spusu_value_guard",
+        ),
+        headers={"X-Processor-Token": "test-token"},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["extracted"]["merchant"] == "spusu"
+    assert body["extracted"]["amount"] == 9.90
+    assert body["extracted"]["tax_amount"] == 1.65
+    assert body["classification"]["category_suggestion"] == "telecom"
+    assert body["review"]["required"] is False
+    assert body["review"]["reason_codes"] == []
+
+
+def test_ollama_null_like_review_reasons_are_ignored(monkeypatch):
+    os.environ["PROCESSOR_SHARED_TOKEN"] = "test-token"
+    module = _load_module("automation_processor_null_review_reason_guard_test")
+
+    def fake_ollama_extract(raw_text, hints=None):
+        return {
+            "merchant": "OpenAI OpCo, LLC",
+            "receipt_date": "2026-01-01",
+            "amount": 20.00,
+            "currency": "EUR",
+            "tax_amount": None,
+            "payment_method": "card",
+            "category_suggestion": "software",
+            "business_relevance_note": "OpenAI subscription/API invoice",
+            "confidence": 0.91,
+            "review_required": False,
+            "review_reasons": ["null", None, ""],
+        }
+
+    monkeypatch.setattr(module, "_call_ollama_extract", fake_ollama_extract)
+    client = TestClient(module.app)
+    response = client.post(
+        "/v1/receipts/extract",
+        json=_receipt_payload(
+            """Receipt
+Date paid January 1, 2026
+OpenAI OpCo, LLC
+$20.00 paid on January 1, 2026""",
+            document_id="doc_openai_review_reason_guard",
+        ),
+        headers={"X-Processor-Token": "test-token"},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["review"]["required"] is False
+    assert body["review"]["reason_codes"] == []

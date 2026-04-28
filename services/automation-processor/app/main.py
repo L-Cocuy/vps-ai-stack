@@ -512,8 +512,47 @@ def _hints_dict(hints: HintsPayload | None) -> dict[str, Any]:
     return {key: value for key, value in hints.model_dump().items() if value is not None}
 
 
+def _is_sane_deterministic_merchant(raw_text: str, merchant: str | None) -> bool:
+    if not merchant:
+        return False
+    merchant_lower = merchant.lower().strip()
+    if not merchant_lower or merchant_lower in {"wien", "vienna", "receipt", "rechnung", "page 1 of 1"}:
+        return False
+    strong_merchant_signals = (
+        "spusu",
+        "billa",
+        "spar",
+        "lidl",
+        "hofer",
+        "openai",
+        "github",
+        "notion",
+        "atlassian",
+        "adobe",
+    )
+    return any(signal in merchant_lower for signal in strong_merchant_signals) and merchant_lower in raw_text.lower()
+
+
+def _clean_review_reasons(reasons: Any) -> list[str]:
+    if isinstance(reasons, str):
+        reasons = [reasons]
+    if not isinstance(reasons, list):
+        return []
+    null_like = {"", "null", "none", "n/a", "na"}
+    cleaned = []
+    for reason in reasons:
+        if reason is None:
+            continue
+        text = str(reason).strip()
+        if text.lower() in null_like:
+            continue
+        cleaned.append(text)
+    return sorted(set(cleaned))
+
+
 def _apply_ollama_values(response: dict[str, Any], ollama_values: dict[str, Any]) -> dict[str, Any]:
     extracted = response["extracted"]
+    heuristic_merchant = extracted.get("merchant")
     heuristic_amount = extracted.get("amount")
     heuristic_tax_amount = extracted.get("tax_amount")
     raw_text = response.get("raw_text") or ""
@@ -521,7 +560,10 @@ def _apply_ollama_values(response: dict[str, Any], ollama_values: dict[str, Any]
     if (
         ollama_values.get("amount") is not None
         and heuristic_amount is not None
-        and ollama_values["amount"] > heuristic_amount * 10
+        and (
+            ollama_values["amount"] > heuristic_amount * 3
+            or ollama_values["amount"] < heuristic_amount / 3
+        )
     ):
         ollama_values["amount"] = heuristic_amount
 
@@ -534,6 +576,10 @@ def _apply_ollama_values(response: dict[str, Any], ollama_values: dict[str, Any]
 
     if ollama_values.get("tax_amount") is not None and heuristic_tax_amount is None and _extract_tax(raw_text) is None:
         ollama_values["tax_amount"] = None
+
+    sane_deterministic_merchant = _is_sane_deterministic_merchant(raw_text, heuristic_merchant)
+    if sane_deterministic_merchant:
+        ollama_values["merchant"] = heuristic_merchant
 
     for key in ("merchant", "receipt_date", "amount", "currency"):
         if key in ollama_values and ollama_values[key] is not None:
@@ -570,11 +616,13 @@ def _apply_ollama_values(response: dict[str, Any], ollama_values: dict[str, Any]
             "tax_amount": 0.8 if extracted.get("tax_amount") is not None else 0.55,
         }
 
-    review_reasons = list(ollama_values.get("review_reasons") or [])
+    review_reasons = _clean_review_reasons(ollama_values.get("review_reasons"))
+    if sane_deterministic_merchant:
+        review_reasons = [reason for reason in review_reasons if "merchant" not in reason.lower()]
     if response["confidence"]["overall"] < CONFIDENCE_REVIEW_THRESHOLD and "low_confidence" not in review_reasons:
         review_reasons.append("low_confidence")
     response["review"] = {
-        "required": bool(ollama_values.get("review_required", False) or review_reasons),
+        "required": bool(review_reasons),
         "reason_codes": sorted(set(review_reasons)),
     }
     return response
