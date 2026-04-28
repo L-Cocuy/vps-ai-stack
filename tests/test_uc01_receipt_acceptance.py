@@ -427,3 +427,85 @@ Description Qty Unit price Tax Amount""",
     assert body["classification"]["business_relevance_note"] == "SaaS or software expense pattern"
     assert body["classification"]["category_reason"] == "SaaS or software expense pattern"
     assert body["extracted"]["tax_amount"] is None
+
+
+def test_deterministic_category_wins_over_wrong_allowed_ollama_category(monkeypatch):
+    os.environ["PROCESSOR_SHARED_TOKEN"] = "test-token"
+    module = _load_module("automation_processor_allowed_category_guard_test")
+
+    def fake_ollama_extract(raw_text, hints=None):
+        return {
+            "merchant": "OpenAI OpCo, LLC",
+            "receipt_date": "2026-01-01",
+            "amount": 20.00,
+            "currency": "EUR",
+            "tax_amount": None,
+            "payment_method": "card",
+            "category_suggestion": "groceries",
+            "business_relevance_note": "Grocery purchase",
+            "confidence": 0.91,
+            "review_required": False,
+            "review_reasons": [],
+        }
+
+    monkeypatch.setattr(module, "_call_ollama_extract", fake_ollama_extract)
+    client = TestClient(module.app)
+    response = client.post(
+        "/v1/receipts/extract",
+        json=_receipt_payload(
+            """Receipt
+Date paid January 1, 2026
+OpenAI OpCo, LLC
+$20.00 paid on January 1, 2026""",
+            document_id="doc_openai_allowed_guard",
+        ),
+        headers={"X-Processor-Token": "test-token"},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["classification"]["category_suggestion"] == "software"
+    assert body["classification"]["business_relevance_note"] == "SaaS or software expense pattern"
+    assert body["classification"]["category_reason"] == "SaaS or software expense pattern"
+
+
+def test_spusu_deterministic_category_wins_over_wrong_allowed_ollama_category(monkeypatch):
+    os.environ["PROCESSOR_SHARED_TOKEN"] = "test-token"
+    module = _load_module("automation_processor_spusu_allowed_category_guard_test")
+
+    def fake_ollama_extract(raw_text, hints=None):
+        return {
+            "merchant": "spusu",
+            "receipt_date": "2026-04-01",
+            "amount": 9.90,
+            "currency": "EUR",
+            "tax_amount": 1.65,
+            "payment_method": None,
+            "category_suggestion": "software",
+            "business_relevance_note": "Software subscription",
+            "confidence": 0.91,
+            "review_required": False,
+            "review_reasons": [],
+        }
+
+    monkeypatch.setattr(module, "_call_ollama_extract", fake_ollama_extract)
+    client = TestClient(module.app)
+    response = client.post(
+        "/v1/receipts/extract",
+        json=_receipt_payload(
+            """spusu
+Rechnung Wien, 01.04.2026
+1 spusu 5G 12.000 Juan Mejia € 9,90
+Gesamtbetrag inkl. USt
+davon 20,00% USt € 1,65 - Nettobetrag € 8,25
+€ 9,90""",
+            document_id="doc_spusu_allowed_guard",
+        ),
+        headers={"X-Processor-Token": "test-token"},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["classification"]["category_suggestion"] == "telecom"
+    assert body["classification"]["business_relevance_note"] == "Mobile/telecom service invoice"
+    assert body["classification"]["category_reason"] == "Mobile/telecom service invoice"
