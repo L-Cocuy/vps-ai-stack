@@ -359,12 +359,9 @@ def _normalize_ollama_extract(candidate: Any) -> dict[str, Any]:
         normalized["confidence"] = max(0.0, min(1.0, float(normalized["confidence"])))
 
     normalized["review_required"] = bool(candidate.get("review_required", False))
-    review_reasons = candidate.get("review_reasons") or []
-    if isinstance(review_reasons, str):
-        review_reasons = [review_reasons]
-    if not isinstance(review_reasons, list):
-        review_reasons = []
-    normalized["review_reasons"] = sorted({str(reason).strip() for reason in review_reasons if str(reason).strip()})
+    normalized["review_reasons"] = _clean_review_reasons(candidate.get("review_reasons"))
+    evidence = candidate.get("evidence")
+    normalized["evidence"] = evidence if isinstance(evidence, dict) else {}
     return normalized
 
 
@@ -550,6 +547,71 @@ def _clean_review_reasons(reasons: Any) -> list[str]:
     return sorted(set(cleaned))
 
 
+def _money_evidence_supports(value: float | None, evidence_text: Any) -> bool:
+    if value is None:
+        return True
+    if not isinstance(evidence_text, str) or not evidence_text.strip():
+        return False
+    return any(abs(candidate_value - value) < 0.01 for _, candidate_value in _money_candidates(evidence_text))
+
+
+def _validate_ollama_evidence(ollama_values: dict[str, Any]) -> dict[str, Any]:
+    evidence = ollama_values.get("evidence") if isinstance(ollama_values.get("evidence"), dict) else {}
+    for key in ("amount", "tax_amount"):
+        if key in evidence and not _money_evidence_supports(ollama_values.get(key), evidence.get(key)):
+            ollama_values[key] = None
+    return ollama_values
+
+
+def _canonical_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
+    normalized = _normalize_ollama_extract(candidate)
+    return _validate_ollama_evidence(normalized)
+
+
+def _candidate_signature(candidate: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        candidate.get("merchant"),
+        candidate.get("receipt_date"),
+        candidate.get("amount"),
+        candidate.get("currency"),
+        candidate.get("tax_amount"),
+        candidate.get("category_suggestion"),
+    )
+
+
+def _get_ollama_vote_attempts() -> int:
+    try:
+        return max(1, min(5, int(os.getenv("OLLAMA_VOTE_ATTEMPTS", "1"))))
+    except ValueError:
+        return 1
+
+
+def _select_ollama_extract(raw_text: str, hints: dict[str, Any] | None = None) -> tuple[dict[str, Any], int]:
+    attempts = _get_ollama_vote_attempts()
+    candidates: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for _ in range(attempts):
+        try:
+            raw_candidate = _call_ollama_extract(raw_text, hints)
+            if raw_candidate:
+                candidates.append(_canonical_candidate(raw_candidate))
+        except Exception as exc:  # noqa: BLE001 - voting should tolerate one bad LLM response
+            errors.append(str(exc))
+
+    if not candidates:
+        raise RuntimeError("; ".join(errors) if errors else "ollama_empty_response")
+
+    counts: dict[tuple[Any, ...], int] = {}
+    for candidate in candidates:
+        signature = _candidate_signature(candidate)
+        counts[signature] = counts.get(signature, 0) + 1
+
+    def rank(candidate: dict[str, Any]) -> tuple[int, float]:
+        return (counts[_candidate_signature(candidate)], float(candidate.get("confidence") or 0.0))
+
+    return max(candidates, key=rank), attempts
+
+
 def _apply_ollama_values(response: dict[str, Any], ollama_values: dict[str, Any]) -> dict[str, Any]:
     extracted = response["extracted"]
     heuristic_merchant = extracted.get("merchant")
@@ -634,7 +696,7 @@ def _extract_structured(payload: ReceiptExtractRequest) -> dict[str, Any]:
     model = os.getenv("OLLAMA_MODEL", "llama3.2")
 
     try:
-        ollama_values = _call_ollama_extract(raw_text, _hints_dict(payload.hints))
+        ollama_values, vote_attempts = _select_ollama_extract(raw_text, _hints_dict(payload.hints))
         if not ollama_values:
             raise ValueError("ollama_empty_response")
         response = _apply_ollama_values(response, ollama_values)
@@ -643,6 +705,7 @@ def _extract_structured(payload: ReceiptExtractRequest) -> dict[str, Any]:
             "model": model,
             "prompt_version": OLLAMA_PROMPT_VERSION,
             "fallback_used": False,
+            "vote_attempts": vote_attempts,
         }
     except Exception as exc:  # noqa: BLE001 - fallback must be resilient for phase-1 automation
         response["extraction"] = {
