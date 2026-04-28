@@ -358,6 +358,9 @@ davon 20,00% USt € 1,65 - Nettobetrag € 8,25
     assert body["extracted"]["receipt_date"] == "2026-04-01"
     assert body["extracted"]["amount"] == 9.90
     assert body["extracted"]["tax_amount"] == 1.65
+    assert body["classification"]["category_suggestion"] == "telecom"
+    assert body["classification"]["business_relevance_note"] == "Mobile/telecom service invoice"
+    assert body["classification"]["category_reason"] == "Mobile/telecom service invoice"
     assert body["extraction"]["engine"] == "heuristic"
     assert body["extraction"]["fallback_used"] is True
 
@@ -379,3 +382,48 @@ def test_sheet_columns_reference_is_present_for_n8n_mapping():
     content = schema.read_text(encoding="utf-8")
     for column in REQUIRED_SHEET_COLUMNS:
         assert f"`{column}`" in content
+
+
+def test_ollama_category_and_tax_are_guarded_by_deterministic_rules(monkeypatch):
+    os.environ["PROCESSOR_SHARED_TOKEN"] = "test-token"
+    module = _load_module("automation_processor_openai_ollama_guard_test")
+
+    def fake_ollama_extract(raw_text, hints=None):
+        return {
+            "merchant": "OpenAI OpCo, LLC",
+            "receipt_date": "2026-01-01",
+            "amount": 20.00,
+            "currency": "USD",
+            "tax_amount": 2.00,
+            "payment_method": "card",
+            "category_suggestion": "Food and Beverages",
+            "business_relevance_note": "Lunch expense",
+            "confidence": 0.91,
+            "review_required": False,
+            "review_reasons": [],
+        }
+
+    monkeypatch.setattr(module, "_call_ollama_extract", fake_ollama_extract)
+    client = TestClient(module.app)
+    response = client.post(
+        "/v1/receipts/extract",
+        json=_receipt_payload(
+            """Page 1 of 1
+Receipt
+Invoice number 877B74AA-0031
+Date paid January 1, 2026
+OpenAI OpCo, LLC
+EU OSS VAT EU372041333
+$20.00 paid on January 1, 2026
+Description Qty Unit price Tax Amount""",
+            document_id="doc_openai_guard",
+        ),
+        headers={"X-Processor-Token": "test-token"},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["classification"]["category_suggestion"] == "software"
+    assert body["classification"]["business_relevance_note"] == "SaaS or software expense pattern"
+    assert body["classification"]["category_reason"] == "SaaS or software expense pattern"
+    assert body["extracted"]["tax_amount"] is None

@@ -42,6 +42,7 @@ MONTHS = {
 }
 
 CURRENCY_SYMBOLS = {"€": "EUR", "$": "USD", "£": "GBP"}
+ALLOWED_CATEGORIES = {"groceries", "software", "travel", "telecom", "misc_review"}
 
 _SIGNATURE_TO_RECORD: dict[str, str] = {}
 _DEDUPE_LOCK = threading.Lock()
@@ -248,6 +249,8 @@ def _classify(raw_text: str, merchant: str | None) -> tuple[str, str]:
         return "groceries", "Retail grocery purchase pattern"
     if any(t in joined for t in ("notion", "openai", "github", "atlassian", "adobe", "software", "saas")):
         return "software", "SaaS or software expense pattern"
+    if any(t in joined for t in ("spusu", "telecom", "mobile", "telefon", "phone service", "5g", "sim card")):
+        return "telecom", "Mobile/telecom service invoice"
     if any(t in joined for t in ("uber", "taxi", "bahn", "train", "flight", "airline")):
         return "travel", "Transport or travel-related expense pattern"
     return "misc_review", "Unable to classify confidently with deterministic phase-1 rules"
@@ -335,6 +338,11 @@ def _normalize_ollama_extract(candidate: Any) -> dict[str, Any]:
     if normalized["payment_method"] and normalized["payment_method"] not in allowed_payment_methods:
         normalized["payment_method"] = "other"
 
+    if normalized["category_suggestion"]:
+        normalized["category_suggestion"] = normalized["category_suggestion"].lower()
+        if normalized["category_suggestion"] not in ALLOWED_CATEGORIES:
+            normalized["category_suggestion"] = None
+
     for key in ("amount", "tax_amount", "confidence"):
         value = candidate.get(key)
         if value is None or value == "":
@@ -374,6 +382,7 @@ Return ONLY one valid JSON object. Do not include markdown or commentary.
 Use null when unsure. Do not invent values.
 Normalize receipt_date as ISO YYYY-MM-DD. Normalize amount/tax_amount as numbers. Normalize currency as ISO 4217.
 Allowed payment_method values: card, cash, bank_transfer, other, null.
+Allowed category_suggestion values: groceries, software, travel, telecom, misc_review, null.
 Required JSON keys: merchant, receipt_date, amount, currency, tax_amount, payment_method, category_suggestion, business_relevance_note, confidence, review_required, review_reasons.
 confidence must be a number from 0 to 1. review_reasons must be an array of machine-readable strings.
 Hints JSON: {json.dumps(hints, ensure_ascii=False)}
@@ -507,6 +516,7 @@ def _apply_ollama_values(response: dict[str, Any], ollama_values: dict[str, Any]
     extracted = response["extracted"]
     heuristic_amount = extracted.get("amount")
     heuristic_tax_amount = extracted.get("tax_amount")
+    raw_text = response.get("raw_text") or ""
 
     if (
         ollama_values.get("amount") is not None
@@ -522,6 +532,9 @@ def _apply_ollama_values(response: dict[str, Any], ollama_values: dict[str, Any]
     ):
         ollama_values["tax_amount"] = heuristic_tax_amount
 
+    if ollama_values.get("tax_amount") is not None and heuristic_tax_amount is None and _extract_tax(raw_text) is None:
+        ollama_values["tax_amount"] = None
+
     for key in ("merchant", "receipt_date", "amount", "currency"):
         if key in ollama_values and ollama_values[key] is not None:
             extracted[key] = ollama_values[key]
@@ -529,11 +542,16 @@ def _apply_ollama_values(response: dict[str, Any], ollama_values: dict[str, Any]
         if key in ollama_values:
             extracted[key] = ollama_values[key]
 
-    if ollama_values.get("category_suggestion"):
-        response["classification"]["category_suggestion"] = ollama_values["category_suggestion"]
-    if ollama_values.get("business_relevance_note"):
-        response["classification"]["business_relevance_note"] = ollama_values["business_relevance_note"]
-        response["classification"]["category_reason"] = ollama_values["business_relevance_note"]
+    category = ollama_values.get("category_suggestion")
+    if isinstance(category, str):
+        category = category.strip().lower()
+    if category not in ALLOWED_CATEGORIES:
+        category = None
+    if category:
+        response["classification"]["category_suggestion"] = category
+        if ollama_values.get("business_relevance_note"):
+            response["classification"]["business_relevance_note"] = ollama_values["business_relevance_note"]
+            response["classification"]["category_reason"] = ollama_values["business_relevance_note"]
 
     confidence = ollama_values.get("confidence")
     if confidence is not None:
