@@ -542,12 +542,19 @@ def _apply_ollama_values(response: dict[str, Any], ollama_values: dict[str, Any]
         if key in ollama_values:
             extracted[key] = ollama_values[key]
 
+    deterministic_category, deterministic_reason = _classify(raw_text, extracted.get("merchant"))
+    deterministic_confident = deterministic_category != "misc_review"
+
     category = ollama_values.get("category_suggestion")
     if isinstance(category, str):
         category = category.strip().lower()
     if category not in ALLOWED_CATEGORIES:
         category = None
-    if category:
+    if deterministic_confident and category and category != deterministic_category:
+        response["classification"]["category_suggestion"] = deterministic_category
+        response["classification"]["business_relevance_note"] = deterministic_reason
+        response["classification"]["category_reason"] = deterministic_reason
+    elif category:
         response["classification"]["category_suggestion"] = category
         if ollama_values.get("business_relevance_note"):
             response["classification"]["business_relevance_note"] = ollama_values["business_relevance_note"]
