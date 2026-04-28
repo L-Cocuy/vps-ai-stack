@@ -380,8 +380,9 @@ Use null when unsure. Do not invent values.
 Normalize receipt_date as ISO YYYY-MM-DD. Normalize amount/tax_amount as numbers. Normalize currency as ISO 4217.
 Allowed payment_method values: card, cash, bank_transfer, other, null.
 Allowed category_suggestion values: groceries, software, travel, telecom, misc_review, null.
-Required JSON keys: merchant, receipt_date, amount, currency, tax_amount, payment_method, category_suggestion, business_relevance_note, confidence, review_required, review_reasons.
+Required JSON keys: merchant, receipt_date, amount, currency, tax_amount, payment_method, category_suggestion, business_relevance_note, confidence, review_required, review_reasons, evidence.
 confidence must be a number from 0 to 1. review_reasons must be an array of machine-readable strings.
+evidence must be an object whose values are exact OCR snippets supporting merchant, amount, tax_amount, receipt_date, and category_suggestion. For money fields, cite the line containing the currency/total, not tariff names or item quantities.
 Hints JSON: {json.dumps(hints, ensure_ascii=False)}
 OCR text:
 {raw_text[:12000]}
@@ -535,15 +536,16 @@ def _clean_review_reasons(reasons: Any) -> list[str]:
         reasons = [reasons]
     if not isinstance(reasons, list):
         return []
-    null_like = {"", "null", "none", "n/a", "na"}
+    null_like = {"", "null", "none", "n/a", "na", "machine_readable_reason_for_review"}
     cleaned = []
     for reason in reasons:
         if reason is None:
             continue
         text = str(reason).strip()
-        if text.lower() in null_like:
+        normalized = text.lower().replace(" ", "_").replace("-", "_")
+        if normalized in null_like or not re.fullmatch(r"[a-z0-9_]+", normalized):
             continue
-        cleaned.append(text)
+        cleaned.append(normalized)
     return sorted(set(cleaned))
 
 
@@ -555,17 +557,31 @@ def _money_evidence_supports(value: float | None, evidence_text: Any) -> bool:
     return any(abs(candidate_value - value) < 0.01 for _, candidate_value in _money_candidates(evidence_text))
 
 
-def _validate_ollama_evidence(ollama_values: dict[str, Any]) -> dict[str, Any]:
+def _raw_text_supports_money_value(raw_text: str, value: float | None) -> bool:
+    if value is None:
+        return True
+    return any(abs(candidate_value - value) < 0.01 for _, candidate_value in _money_candidates(raw_text))
+
+
+def _raw_text_supports_payment_method(raw_text: str, payment_method: str | None) -> bool:
+    if payment_method is None:
+        return True
+    return _extract_payment_method(raw_text) == payment_method
+
+
+def _validate_ollama_evidence(ollama_values: dict[str, Any], raw_text: str = "") -> dict[str, Any]:
     evidence = ollama_values.get("evidence") if isinstance(ollama_values.get("evidence"), dict) else {}
     for key in ("amount", "tax_amount"):
         if key in evidence and not _money_evidence_supports(ollama_values.get(key), evidence.get(key)):
             ollama_values[key] = None
+        elif raw_text and not _raw_text_supports_money_value(raw_text, ollama_values.get(key)):
+            ollama_values[key] = None
     return ollama_values
 
 
-def _canonical_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
+def _canonical_candidate(candidate: dict[str, Any], raw_text: str = "") -> dict[str, Any]:
     normalized = _normalize_ollama_extract(candidate)
-    return _validate_ollama_evidence(normalized)
+    return _validate_ollama_evidence(normalized, raw_text)
 
 
 def _candidate_signature(candidate: dict[str, Any]) -> tuple[Any, ...]:
@@ -594,7 +610,7 @@ def _select_ollama_extract(raw_text: str, hints: dict[str, Any] | None = None) -
         try:
             raw_candidate = _call_ollama_extract(raw_text, hints)
             if raw_candidate:
-                candidates.append(_canonical_candidate(raw_candidate))
+                candidates.append(_canonical_candidate(raw_candidate, raw_text))
         except Exception as exc:  # noqa: BLE001 - voting should tolerate one bad LLM response
             errors.append(str(exc))
 
@@ -625,6 +641,7 @@ def _apply_ollama_values(response: dict[str, Any], ollama_values: dict[str, Any]
         and (
             ollama_values["amount"] > heuristic_amount * 3
             or ollama_values["amount"] < heuristic_amount / 3
+            or not _raw_text_supports_money_value(raw_text, ollama_values["amount"])
         )
     ):
         ollama_values["amount"] = heuristic_amount
@@ -638,6 +655,12 @@ def _apply_ollama_values(response: dict[str, Any], ollama_values: dict[str, Any]
 
     if ollama_values.get("tax_amount") is not None and heuristic_tax_amount is None and _extract_tax(raw_text) is None:
         ollama_values["tax_amount"] = None
+    if ollama_values.get("tax_amount") is None and heuristic_tax_amount is not None:
+        ollama_values["tax_amount"] = heuristic_tax_amount
+
+    heuristic_payment_method = extracted.get("payment_method")
+    if ollama_values.get("payment_method") and not _raw_text_supports_payment_method(raw_text, ollama_values.get("payment_method")):
+        ollama_values["payment_method"] = heuristic_payment_method
 
     sane_deterministic_merchant = _is_sane_deterministic_merchant(raw_text, heuristic_merchant)
     if sane_deterministic_merchant:
@@ -681,6 +704,12 @@ def _apply_ollama_values(response: dict[str, Any], ollama_values: dict[str, Any]
     review_reasons = _clean_review_reasons(ollama_values.get("review_reasons"))
     if sane_deterministic_merchant:
         review_reasons = [reason for reason in review_reasons if "merchant" not in reason.lower()]
+    if extracted.get("merchant") and extracted.get("receipt_date") and extracted.get("amount") is not None:
+        review_reasons = [reason for reason in review_reasons if reason.lower() not in {"invalid_receipt_format", "invalid receipt format", "not_a_receipt", "not a receipt"}]
+    if extracted.get("amount") is not None:
+        review_reasons = [reason for reason in review_reasons if "amount" not in reason.lower()]
+    if extracted.get("tax_amount") is not None:
+        review_reasons = [reason for reason in review_reasons if "tax" not in reason.lower() and "ust" not in reason.lower() and "vat" not in reason.lower()]
     if response["confidence"]["overall"] < CONFIDENCE_REVIEW_THRESHOLD and "low_confidence" not in review_reasons:
         review_reasons.append("low_confidence")
     response["review"] = {
