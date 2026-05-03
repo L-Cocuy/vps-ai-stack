@@ -162,7 +162,9 @@ def _money_candidates(raw_text: str) -> list[tuple[str, float]]:
         re.compile(r"\b(EUR|USD|GBP|CHF)\b[^\d]{0,8}([0-9][0-9.,]*)", re.IGNORECASE),
         re.compile(r"([0-9][0-9.,]*)[^\w]{0,3}\b(EUR|USD|GBP|CHF)\b", re.IGNORECASE),
         re.compile(r"([€$£])\s*([0-9][0-9.,]*)"),
-        re.compile(r"([0-9][0-9.,]*)\s*([€$£])"),
+        # Match suffix currency amounts like "9,90 €", but do not treat a year before
+        # a prefix-currency amount like "April 2026 € 9,90" as money.
+        re.compile(r"([0-9][0-9.,]*)\s*([€$£])(?!\s*\d)"),
     ]
     for pattern in patterns:
         for match in pattern.finditer(raw_text):
@@ -372,7 +374,8 @@ def _call_ollama_extract(raw_text: str, hints: dict[str, Any] | None = None) -> 
     """
     base_url = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434").rstrip("/")
     model = os.getenv("OLLAMA_MODEL", "llama3.2")
-    timeout = float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "45"))
+    timeout = float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "90"))
+    keep_alive = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
     hints = hints or {}
     prompt = f"""You extract accounting fields from receipt OCR text.
 Return ONLY one valid JSON object. Do not include markdown or commentary.
@@ -387,7 +390,7 @@ Hints JSON: {json.dumps(hints, ensure_ascii=False)}
 OCR text:
 {raw_text[:12000]}
 """
-    request_body = json.dumps({"model": model, "prompt": prompt, "stream": False, "format": "json"}).encode("utf-8")
+    request_body = json.dumps({"model": model, "prompt": prompt, "stream": False, "format": "json", "keep_alive": keep_alive}).encode("utf-8")
     request = urllib.request.Request(
         f"{base_url}/api/generate",
         data=request_body,
@@ -595,27 +598,52 @@ def _candidate_signature(candidate: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
-def _get_ollama_vote_attempts() -> int:
+def _bounded_int_env(name: str, default: int, minimum: int = 1, maximum: int = 5) -> int:
     try:
-        return max(1, min(5, int(os.getenv("OLLAMA_VOTE_ATTEMPTS", "1"))))
+        return max(minimum, min(maximum, int(os.getenv(name, str(default)))))
     except ValueError:
-        return 1
+        return default
 
 
-def _select_ollama_extract(raw_text: str, hints: dict[str, Any] | None = None) -> tuple[dict[str, Any], int]:
-    attempts = _get_ollama_vote_attempts()
+def _get_ollama_vote_attempts() -> int:
+    return _bounded_int_env("OLLAMA_VOTE_ATTEMPTS", 1)
+
+
+def _get_ollama_retry_attempts() -> int:
+    return _bounded_int_env("OLLAMA_RETRY_ATTEMPTS", 2)
+
+
+def _call_ollama_with_retries(raw_text: str, hints: dict[str, Any] | None, retry_attempts: int) -> tuple[dict[str, Any] | None, int]:
+    last_error: Exception | None = None
+    for attempt in range(1, retry_attempts + 1):
+        try:
+            return _call_ollama_extract(raw_text, hints), attempt
+        except Exception as exc:  # noqa: BLE001 - transient Ollama failures should retry before fallback
+            last_error = exc
+    if last_error:
+        raise last_error
+    return None, retry_attempts
+
+
+def _select_ollama_extract(raw_text: str, hints: dict[str, Any] | None = None) -> tuple[dict[str, Any], int, int]:
+    vote_attempts = _get_ollama_vote_attempts()
+    retry_attempts = _get_ollama_retry_attempts()
+    max_retry_attempts_used = 0
     candidates: list[dict[str, Any]] = []
     errors: list[str] = []
-    for _ in range(attempts):
+    for _ in range(vote_attempts):
         try:
-            raw_candidate = _call_ollama_extract(raw_text, hints)
+            raw_candidate, attempts_used = _call_ollama_with_retries(raw_text, hints, retry_attempts)
+            max_retry_attempts_used = max(max_retry_attempts_used, attempts_used)
             if raw_candidate:
                 candidates.append(_canonical_candidate(raw_candidate, raw_text))
         except Exception as exc:  # noqa: BLE001 - voting should tolerate one bad LLM response
+            max_retry_attempts_used = max(max_retry_attempts_used, retry_attempts)
             errors.append(str(exc))
 
     if not candidates:
-        raise RuntimeError("; ".join(errors) if errors else "ollama_empty_response")
+        message = "; ".join(errors) if errors else "ollama_empty_response"
+        raise RuntimeError(f"{message} | retry_attempts={max_retry_attempts_used or retry_attempts}")
 
     counts: dict[tuple[Any, ...], int] = {}
     for candidate in candidates:
@@ -625,7 +653,7 @@ def _select_ollama_extract(raw_text: str, hints: dict[str, Any] | None = None) -
     def rank(candidate: dict[str, Any]) -> tuple[int, float]:
         return (counts[_candidate_signature(candidate)], float(candidate.get("confidence") or 0.0))
 
-    return max(candidates, key=rank), attempts
+    return max(candidates, key=rank), vote_attempts, max_retry_attempts_used or 1
 
 
 def _apply_ollama_values(response: dict[str, Any], ollama_values: dict[str, Any]) -> dict[str, Any]:
@@ -724,8 +752,9 @@ def _extract_structured(payload: ReceiptExtractRequest) -> dict[str, Any]:
     response = _heuristic_extract(raw_text, payload)
     model = os.getenv("OLLAMA_MODEL", "llama3.2")
 
+    retry_attempts = _get_ollama_retry_attempts()
     try:
-        ollama_values, vote_attempts = _select_ollama_extract(raw_text, _hints_dict(payload.hints))
+        ollama_values, vote_attempts, retry_attempts_used = _select_ollama_extract(raw_text, _hints_dict(payload.hints))
         if not ollama_values:
             raise ValueError("ollama_empty_response")
         response = _apply_ollama_values(response, ollama_values)
@@ -735,14 +764,19 @@ def _extract_structured(payload: ReceiptExtractRequest) -> dict[str, Any]:
             "prompt_version": OLLAMA_PROMPT_VERSION,
             "fallback_used": False,
             "vote_attempts": vote_attempts,
+            "retry_attempts": retry_attempts_used,
         }
     except Exception as exc:  # noqa: BLE001 - fallback must be resilient for phase-1 automation
+        reason_codes = set(response.get("review", {}).get("reason_codes") or [])
+        reason_codes.add("ollama_unavailable")
+        response["review"] = {"required": True, "reason_codes": sorted(reason_codes)}
         response["extraction"] = {
             "engine": "heuristic",
             "model": model,
             "prompt_version": OLLAMA_PROMPT_VERSION,
             "fallback_used": True,
             "fallback_reason": str(exc),
+            "retry_attempts": retry_attempts,
         }
 
     return response
