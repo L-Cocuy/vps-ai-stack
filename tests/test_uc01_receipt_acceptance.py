@@ -104,7 +104,27 @@ def test_healthz_contract():
     assert response.json()["service"] == "automation-processor"
 
 
-def test_clean_receipt_extracts_finance_fields_and_needs_no_review():
+def test_clean_receipt_extracts_finance_fields_and_needs_no_review(monkeypatch):
+    os.environ["PROCESSOR_SHARED_TOKEN"] = "test-token"
+    module = _load_module("automation_processor_clean_receipt_test")
+
+    def fake_ollama_extract(raw_text, hints=None):
+        return {
+            "merchant": "BILLA Wien Mitte",
+            "receipt_date": "2026-04-12",
+            "amount": 18.90,
+            "currency": "EUR",
+            "tax_amount": 1.72,
+            "payment_method": "card",
+            "category_suggestion": "groceries",
+            "business_relevance_note": "Retail grocery purchase pattern",
+            "confidence": 0.92,
+            "review_required": False,
+            "review_reasons": [],
+            "evidence": {"amount": "Summe EUR 18,90", "tax_amount": "MwSt 10% EUR 1,72"},
+        }
+
+    monkeypatch.setattr(module, "_call_ollama_extract", fake_ollama_extract)
     text = """
     BILLA Wien Mitte
     Datum: 12.04.2026
@@ -112,7 +132,7 @@ def test_clean_receipt_extracts_finance_fields_and_needs_no_review():
     MwSt 10% EUR 1,72
     Zahlung: Karte
     """
-    response = _client().post(
+    response = TestClient(module.app).post(
         "/v1/receipts/extract",
         json=_receipt_payload(text, document_id="doc_clean", source_channel="telegram"),
         headers={"X-Processor-Token": "test-token"},
@@ -346,7 +366,16 @@ Belegnummer: SR-2140225/2026
 1 spusu 5G 12.000 0676 347 9670 Juan Mejia € 9,90
 Gesamtbetrag inkl. USt
 davon 20,00% USt € 1,65 - Nettobetrag € 8,25
-€ 9,90""",
+€ 9,90
+Zahlungsbedingungen
+Detailansicht
+Juan Mejia   0676 347 9670
+Grundgebühren
+spusu 5G 12.000   April 2026 € 9,90
+max. 1000 Minuten und max. 1000 SMS nach Österreich, mind. 10 GB
+Verrechnet - Verbindungsentgelte     März 2026
+Preis inkl. USt € 9,90
+SR-2140225/2026""",
             document_id="doc_spusu_fallback",
         ),
         headers={"X-Processor-Token": "test-token"},
@@ -363,6 +392,102 @@ davon 20,00% USt € 1,65 - Nettobetrag € 8,25
     assert body["classification"]["category_reason"] == "Mobile/telecom service invoice"
     assert body["extraction"]["engine"] == "heuristic"
     assert body["extraction"]["fallback_used"] is True
+
+
+def test_money_candidates_do_not_treat_invoice_year_before_currency_symbol_as_amount():
+    module = _load_module("automation_processor_spusu_year_money_guard_test")
+    candidates = module._money_candidates(
+        """Grundgebühren
+spusu 5G 12.000   April 2026 € 9,90
+Preis inkl. USt € 9,90
+SR-2140225/2026"""
+    )
+
+    assert ("EUR", 9.90) in candidates
+    assert ("EUR", 2026.0) not in candidates
+
+
+def test_ollama_retries_transient_timeout_before_using_heuristic(monkeypatch):
+    os.environ["PROCESSOR_SHARED_TOKEN"] = "test-token"
+    os.environ["OLLAMA_RETRY_ATTEMPTS"] = "2"
+    module = _load_module("automation_processor_ollama_retry_test")
+    calls = []
+
+    def flaky_ollama_extract(raw_text, hints=None):
+        calls.append(raw_text)
+        if len(calls) == 1:
+            raise RuntimeError("ollama_request_failed: timed out")
+        return {
+            "merchant": "spusu",
+            "receipt_date": "2026-04-01",
+            "amount": 9.90,
+            "currency": "EUR",
+            "tax_amount": 1.65,
+            "payment_method": "card",
+            "category_suggestion": "telecom",
+            "business_relevance_note": "Mobile phone service invoice",
+            "confidence": 0.91,
+            "review_required": False,
+            "review_reasons": [],
+            "evidence": {"amount": "€ 9,90", "tax_amount": "USt € 1,65"},
+        }
+
+    monkeypatch.setattr(module, "_call_ollama_extract", flaky_ollama_extract)
+    client = TestClient(module.app)
+    response = client.post(
+        "/v1/receipts/extract",
+        json=_receipt_payload(
+            """spusu
+Rechnung Wien, 01.04.2026
+spusu 5G 12.000   April 2026 € 9,90
+Gesamtbetrag inkl. USt
+USt € 1,65
+€ 9,90""",
+            document_id="doc_ollama_retry",
+        ),
+        headers={"X-Processor-Token": "test-token"},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert len(calls) == 2
+    assert body["extracted"]["amount"] == 9.90
+    assert body["extraction"]["engine"] == "ollama"
+    assert body["extraction"]["fallback_used"] is False
+    assert body["extraction"]["retry_attempts"] == 2
+
+
+def test_heuristic_fallback_requires_review_when_ollama_fails(monkeypatch):
+    os.environ["PROCESSOR_SHARED_TOKEN"] = "test-token"
+    os.environ["OLLAMA_RETRY_ATTEMPTS"] = "2"
+    module = _load_module("automation_processor_fallback_review_test")
+
+    def unavailable(raw_text, hints=None):
+        raise RuntimeError("ollama_request_failed: timed out")
+
+    monkeypatch.setattr(module, "_call_ollama_extract", unavailable)
+    client = TestClient(module.app)
+    response = client.post(
+        "/v1/receipts/extract",
+        json=_receipt_payload(
+            """spusu
+Rechnung Wien, 01.04.2026
+spusu 5G 12.000   April 2026 € 9,90
+Gesamtbetrag inkl. USt
+USt € 1,65
+€ 9,90""",
+            document_id="doc_fallback_review",
+        ),
+        headers={"X-Processor-Token": "test-token"},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["extraction"]["engine"] == "heuristic"
+    assert body["extraction"]["fallback_used"] is True
+    assert body["extraction"]["retry_attempts"] == 2
+    assert body["review"]["required"] is True
+    assert "ollama_unavailable" in body["review"]["reason_codes"]
 
 
 def test_processor_rejects_missing_or_wrong_shared_token():
